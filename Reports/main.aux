@@ -1,0 +1,100 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{zafari2019survey}
+\citation{uwb_ieee802154}
+\citation{nlos_survey}
+\citation{kalman_uwb}
+\citation{LS_positioning}
+\citation{lstm_uwb,gru_positioning}
+\citation{vaswani2017attention}
+\@writefile{toc}{\contentsline {section}{\numberline {I}Introduction}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {I-A}}Contributions}{1}{subsection.1.1}\protected@file@percent }
+\citation{uwb_ieee802154}
+\citation{LS_positioning}
+\citation{kalman_uwb}
+\citation{cnn_uwb}
+\citation{lstm_uwb,gru_positioning}
+\citation{vaswani2017attention}
+\@writefile{toc}{\contentsline {section}{\numberline {II}Related Work}{2}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{II}{2}{Related Work}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-A}}UWB Indoor Positioning}{2}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-B}}Kalman Filtering for Range Smoothing}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {II-C}}Deep Learning for Positioning}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {III}System Model and Problem Formulation}{2}{section.3}\protected@file@percent }
+\newlabel{sec:system}{{III}{2}{System Model and Problem Formulation}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-A}}UWB Ranging System}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces Anchor Positions --- LOS Environment (Open Hall, $4000 \times 8800$\,mm)}}{2}{table.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:anchors_los}{{I}{2}{Anchor Positions --- LOS Environment (Open Hall, $4000 \times 8800$\,mm)}{table.caption.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Anchor Positions --- NLOS Environment (Indoor Room, $6193 \times 4805$\,mm)}}{2}{table.caption.2}\protected@file@percent }
+\newlabel{tab:anchors_nlos}{{II}{2}{Anchor Positions --- NLOS Environment (Indoor Room, $6193 \times 4805$\,mm)}{table.caption.2}{}}
+\newlabel{eq:range_model}{{1}{2}{UWB Ranging System}{equation.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-B}}Least Squares Positioning}{2}{subsection.3.2}\protected@file@percent }
+\newlabel{eq:LS}{{2}{2}{Least Squares Positioning}{equation.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {III-C}}Problem Statement}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{eq:correction}{{3}{3}{Problem Statement}{equation.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {IV}Proposed Method}{3}{section.4}\protected@file@percent }
+\newlabel{sec:method}{{IV}{3}{Proposed Method}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-A}}Stage 1: Kalman Filter Preprocessing}{3}{subsection.4.1}\protected@file@percent }
+\newlabel{sec:kf}{{\mbox  {IV-A}}{3}{Stage 1: Kalman Filter Preprocessing}{subsection.4.1}{}}
+\newlabel{eq:kf_model}{{4}{3}{Stage 1: Kalman Filter Preprocessing}{equation.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-B}}Stage 2: Feature Engineering}{3}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:features}{{\mbox  {IV-B}}{3}{Stage 2: Feature Engineering}{subsection.4.2}{}}
+\newlabel{eq:features}{{6}{3}{Stage 2: Feature Engineering}{equation.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-C}}Stage 3: Self-Attention Enhanced GRU Network}{3}{subsection.4.3}\protected@file@percent }
+\newlabel{sec:model}{{\mbox  {IV-C}}{3}{Stage 3: Self-Attention Enhanced GRU Network}{subsection.4.3}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-C}1}Input Projection}{3}{subsubsection.4.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-C}2}Multi-Head Self-Attention}{3}{subsubsection.4.3.2}\protected@file@percent }
+\newlabel{eq:residual}{{11}{3}{Multi-Head Self-Attention}{equation.11}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-C}3}Gated Recurrent Unit}{3}{subsubsection.4.3.3}\protected@file@percent }
+\citation{adamw}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Model Architecture}}{4}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:pipeline}{{1}{4}{Model Architecture}{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {\mbox  {IV-C}4}Output Head}{4}{subsubsection.4.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-D}}Stage 4: Corrected LS Positioning}{4}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-E}}Ablation Variants}{4}{subsection.4.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {IV-F}}Training Procedure}{4}{subsection.4.6}\protected@file@percent }
+\newlabel{sec:training}{{\mbox  {IV-F}}{4}{Training Procedure}{subsection.4.6}{}}
+\newlabel{eq:loss}{{17}{4}{Training Procedure}{equation.17}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {V}Experimental Setup}{4}{section.5}\protected@file@percent }
+\newlabel{sec:experiments}{{V}{4}{Experimental Setup}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-A}}Hardware Configuration}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-B}}Ground Truth Path}{5}{subsection.5.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {III}{\ignorespaces Ground Truth Waypoints --- LOS Environment}}{5}{table.caption.4}\protected@file@percent }
+\newlabel{tab:waypoints_los}{{III}{5}{Ground Truth Waypoints --- LOS Environment}{table.caption.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {IV}{\ignorespaces Ground Truth Waypoints --- NLOS Environment}}{5}{table.caption.5}\protected@file@percent }
+\newlabel{tab:waypoints_nlos}{{IV}{5}{Ground Truth Waypoints --- NLOS Environment}{table.caption.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-C}}Dataset}{5}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-D}}Evaluation Metrics}{5}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {V-E}}Implementation Details}{5}{subsection.5.5}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {V}{\ignorespaces Model Complexity Comparison}}{5}{table.caption.6}\protected@file@percent }
+\newlabel{tab:params}{{V}{5}{Model Complexity Comparison}{table.caption.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {VI}Results and Discussion}{5}{section.6}\protected@file@percent }
+\newlabel{sec:results}{{VI}{5}{Results and Discussion}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-A}}Overall Positioning Accuracy}{5}{subsection.6.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {VI}{\ignorespaces Positioning Accuracy --- LOS Environment (Open Hall, No Obstructions)}}{6}{table.caption.7}\protected@file@percent }
+\newlabel{tab:results_los}{{VI}{6}{Positioning Accuracy --- LOS Environment (Open Hall, No Obstructions)}{table.caption.7}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {VII}{\ignorespaces Positioning Accuracy --- NLOS Environment (Indoor Room with Multipath)}}{6}{table.caption.8}\protected@file@percent }
+\newlabel{tab:results_nlos}{{VII}{6}{Positioning Accuracy --- NLOS Environment (Indoor Room with Multipath)}{table.caption.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-B}}Impact of Kalman Filter Preprocessing}{6}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {\mbox  {VI-C}}Ablation Study: Self-Attention vs.\ GRU}{6}{subsection.6.3}\protected@file@percent }
+\newlabel{sec:ablation}{{\mbox  {VI-C}}{6}{Ablation Study: Self-Attention vs.\ GRU}{subsection.6.3}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {VIII}{\ignorespaces Ablation Study --- Component Contributions (RMSE, mm)}}{6}{table.caption.9}\protected@file@percent }
+\newlabel{tab:ablation}{{VIII}{6}{Ablation Study --- Component Contributions (RMSE, mm)}{table.caption.9}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {VII}Conclusion}{6}{section.7}\protected@file@percent }
+\newlabel{sec:conclusion}{{VII}{6}{Conclusion}{section.7}{}}
+\bibstyle{IEEEtran}
+\bibcite{zafari2019survey}{1}
+\bibcite{uwb_ieee802154}{2}
+\bibcite{nlos_survey}{3}
+\bibcite{kalman_uwb}{4}
+\bibcite{LS_positioning}{5}
+\bibcite{lstm_uwb}{6}
+\bibcite{gru_positioning}{7}
+\bibcite{vaswani2017attention}{8}
+\bibcite{cnn_uwb}{9}
+\bibcite{adamw}{10}
+\@writefile{toc}{\contentsline {section}{References}{7}{section*.10}\protected@file@percent }
+\gdef \@abspage@last{7}
