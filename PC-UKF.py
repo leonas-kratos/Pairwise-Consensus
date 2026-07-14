@@ -59,8 +59,8 @@ GT_SPACING = 5.0     # mm
 N_ANCHORS  = 4
 
 # UKF-2D params
-UKF2D_Q     = 0.1    # Process noise (mm^2)
-UKF2D_R     = 300.0  # Measurement noise (mm^2) per anchor
+UKF2D_Q     = 0.01    # Process noise (mm^2)
+UKF2D_R     = 200.0  # Measurement noise (mm^2) per anchor
 UKF2D_ALPHA = 1e-3   # UKF spread parameter
 UKF2D_BETA  = 2.0    # UKF distribution parameter (2 optimal for Gaussian)
 UKF2D_KAPPA = 0.0    # UKF secondary scaling

@@ -62,9 +62,9 @@ PCKF_R_BASE  = 200.0
 PCKF_R_SCALE = 10.0    # R_i = R_base * (1 + r_scale * (1 - score_i))
 PCKF_SIGMA   = 200.0   # mm — ngưỡng innovation "bình thường"
 
-DO_GRID_SEARCH  = False
+DO_GRID_SEARCH  = True
 DATA_DIR = "./data"
-SAVE_DIR = "./outputs_vPC"
+SAVE_DIR = "./outputs_vKFPC"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -107,7 +107,8 @@ def wls_position(distances, anchors=ANCHORS):
         di     = max(distances[i], 1.0)
         rows.append([2*(xi-x0), 2*(yi-y0)])
         b.append((d0**2 - di**2) - (x0**2 - xi**2) - (y0**2 - yi**2))
-        w.append(1.0 / di)
+        # w.append(1.0 / di)
+        w.append(1.0 / 1.0)
     A  = np.array(rows, dtype=float)
     bv = np.array(b,    dtype=float)
     W  = np.diag(w)
@@ -155,7 +156,7 @@ class PCKF:
             s = 0.0
             cnt = 0
             for j in range(N_ANCHORS):
-                if i == j: continue
+                if i == j: continue 
                 diff = innov[i] - innov[j]
                 nu = 4.0
                 c = (1.0 + (diff * diff) / (nu * self.sigma * self.sigma + eps)) ** (-(nu + 1.0) / 2.0)
@@ -491,8 +492,8 @@ def main():
     import random; random.seed(42); np.random.seed(42)
     perm        = np.random.permutation(n)
     shuffled    = [all_files[i] for i in perm]
-    n_train     = min(0, n)
-    n_val       = min(0, max(0, n - n_train))
+    n_train     = min(4, n)
+    n_val       = min(2, max(0, n - n_train))
     train_files = shuffled[:n_train]
     val_files   = shuffled[n_train:n_train + n_val]
     test_files  = shuffled[n_train + n_val:]
