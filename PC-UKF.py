@@ -60,16 +60,16 @@ N_ANCHORS  = 4
 
 # UKF-2D params
 UKF2D_Q     = 0.01    # Process noise (mm^2)
-UKF2D_R     = 200.0  # Measurement noise (mm^2) per anchor
+UKF2D_R     = 300.0  # Measurement noise (mm^2) per anchor
 UKF2D_ALPHA = 1e-3   # UKF spread parameter
 UKF2D_BETA  = 2.0    # UKF distribution parameter (2 optimal for Gaussian)
 UKF2D_KAPPA = 0.0    # UKF secondary scaling
 
 # PC-UKF-2D params
 PCUKF2D_Q       = 0.01
-PCUKF2D_R_BASE  = 200.0
-PCUKF2D_R_SCALE = 5.0
-PCUKF2D_SIGMA   = 25.0
+PCUKF2D_R_BASE  = 300.0
+PCUKF2D_R_SCALE = 20.0
+PCUKF2D_SIGMA   = 20.0
 
 # PC-LS params (no filter state, just weighted WLS per timestep)
 PCLS_R_BASE  = 200.0
@@ -80,7 +80,7 @@ PCLS_SIGMA   = 200.0
 PC_KF_Q = 0.01
 PC_KF_R = 200.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_vPCUKF"
 
@@ -309,22 +309,29 @@ class _KF1D_for_PC:
         return innovation
 
 
-def pc_consensus_scores(innovations, sigma=PCUKF2D_SIGMA):
-    """
-    Tính consensus score từ innovation của mỗi anchor.
-    Dùng Student-t kernel để robust với outlier.
-    Score cao (~1) = anchor tin cậy.
-    """
-    innov  = np.abs(innovations)
+def pc_consensus_scores(innovations, sigma=PCUKF2D_SIGMA, d_raw=None):
+    # dùng residual nếu có d_raw, fallback về innovation
+    if d_raw is not None:
+        pos_est = wls_position(d_raw)
+        if not np.any(np.isnan(pos_est)):
+            residual = np.zeros(N_ANCHORS)
+            for i, (ax, ay) in enumerate(ANCHORS):
+                d_est = math.sqrt((pos_est[0]-ax)**2 + (pos_est[1]-ay)**2)
+                residual[i] = abs(d_raw[i] - d_est)
+        else:
+            residual = np.abs(innovations)
+    else:
+        residual = np.abs(innovations)
+
     scores = np.zeros(N_ANCHORS)
-    eps    = 1e-9
+    eps = 1e-9
     for i in range(N_ANCHORS):
         s = 0.0; cnt = 0
         for j in range(N_ANCHORS):
             if i == j: continue
-            diff = innov[i] - innov[j]
-            nu   = 4.0
-            c    = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu + 1.0) / 2.0)
+            diff = residual[i] - residual[j]
+            nu = 4.0
+            c = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu+1.0)/2.0)
             s += c; cnt += 1
         scores[i] = s / cnt
     return scores
@@ -357,7 +364,7 @@ class PCUKF2D:
         innovations = np.array([self._kfs[i].update(z_raw[i]) for i in range(N_ANCHORS)])
 
         # Bước 2: PC consensus score → R adaptive
-        scores = pc_consensus_scores(innovations, self.sigma)
+        scores = pc_consensus_scores(innovations, self.sigma, d_raw=z_raw)
         R_diag = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
 
         # Bước 3: UKF step với R_adaptive
@@ -578,10 +585,10 @@ def compute_metrics(errors, label=""):
 # ══════════════════════════════════════════════════════════════════════
 def grid_search(val_files, gt_xy):
     grid = {
-        'q'      : [0.1, 1.0, 10.0],
-        'r_base' : [50.0, 100.0, 200.0, 300.0],
-        'r_scale': [5.0, 10.0, 20.0],
-        'sigma'  : [50.0, 100.0, 200.0],
+        'q'      : [0.001, 0.01, 0.1],
+        'r_base' : [1.0, 10.0, 25.0, 50.0, 100.0, 200.0, 300.0],
+        'r_scale': [5.0, 10.0, 15.0, 20.0],
+        'sigma'  : [10.0, 50.0, 100.0, 150.0, 200.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -740,6 +747,66 @@ def analyze_scores(file_paths, q=PCUKF2D_Q, r_base=PCUKF2D_R_BASE,
         print(f"[✓] Score analysis → {save_path}")
     plt.close()
 
+def debug_pcukf(file_path, gt_xy, n_samples=20):
+    parsed = parse_file(file_path)
+    dist_raw = parsed['dist'].astype(float)
+    
+    pcukf = PCUKF2D()
+    
+    # Init
+    init_pos = wls_position(dist_raw[0])
+    pcukf.init(init_pos if not np.any(np.isnan(init_pos)) else np.array([2000.0, 4400.0]))
+
+    print("\n" + "═"*110)
+    print("DEBUG PC-UKF-2D — 20 samples đầu")
+    print("═"*110)
+    print(f"{'t':>4} | {'d_raw':>40} | {'innov':>40} | {'scores':>30} | {'R':>30}")
+    print("─"*110)
+
+    for t in range(min(n_samples, len(dist_raw))):
+        d = dist_raw[t]
+
+        # Tính innovation từ KF 1D phụ trợ (trước khi update)
+        innov_raw = np.array([pcukf._kfs[i].x for i in range(N_ANCHORS)])
+        innov_raw = np.where(innov_raw is None, 0.0, innov_raw)
+        innovations = np.array([
+            d[i] - pcukf._kfs[i].x if pcukf._kfs[i].x is not None else 0.0
+            for i in range(N_ANCHORS)
+        ])
+
+        scores = pc_consensus_scores(innovations, pcukf.sigma)
+        R_diag = pcukf.R_base * (1.0 + pcukf.R_scale * (1.0 - scores))
+
+        pos, sc, R = pcukf.step(d)
+
+        print(f"{t:>4} | {str(np.round(d,1)):>40} | "
+              f"{str(np.round(np.abs(innovations),1)):>40} | "
+              f"{str(np.round(scores,3)):>30} | "
+              f"{str(np.round(R_diag,1)):>30}")
+
+    print("\n── Phân phối scores toàn bộ file ──")
+    pcukf2 = PCUKF2D()
+    init_pos = wls_position(dist_raw[0])
+    pcukf2.init(init_pos if not np.any(np.isnan(init_pos)) else np.array([2000.0, 4400.0]))
+
+    all_scores = []
+    all_R      = []
+    for t in range(len(dist_raw)):
+        _, sc, R = pcukf2.step(dist_raw[t])
+        all_scores.append(sc)
+        all_R.append(R)
+    all_scores = np.array(all_scores)
+    all_R      = np.array(all_R)
+
+    print(f"  Score mean per anchor: {np.mean(all_scores, axis=0).round(3)}")
+    print(f"  Score std  per anchor: {np.std(all_scores,  axis=0).round(3)}")
+    print(f"  Score < 0.3 (nghi ngờ):  {(all_scores < 0.3).sum(axis=0)} lần")
+    print(f"  Score > 0.7 (tin tưởng): {(all_scores > 0.7).sum(axis=0)} lần")
+
+    print("\n── R adaptive distribution ──")
+    print(f"  R mean: {np.mean(all_R, axis=0).round(1)}")
+    print(f"  R min:  {np.min(all_R,  axis=0).round(1)}")
+    print(f"  R max:  {np.max(all_R,  axis=0).round(1)}")
 
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN
@@ -760,8 +827,8 @@ def main():
     import random; random.seed(42); np.random.seed(42)
     perm        = np.random.permutation(n)
     shuffled    = [all_files[i] for i in perm]
-    n_train     = min(0, n)
-    n_val       = min(0, max(0, n - n_train))
+    n_train     = min(4, n)
+    n_val       = min(2, max(0, n - n_train))
     train_files = shuffled[:n_train]
     val_files   = shuffled[n_train:n_train + n_val]
     test_files  = shuffled[n_train + n_val:]
@@ -780,6 +847,8 @@ def main():
         print("\n[INFO] Grid Search TẮT — dùng params mặc định.")
 
     eval_files = test_files or val_files or train_files or all_files
+
+    debug_pcukf(eval_files[0], gt_xy)
 
     print(f"\n{'═'*60}\n  Evaluating trên {len(eval_files)} files\n{'═'*60}")
     err, positions = evaluate_files(eval_files, gt_xy, **best_params)

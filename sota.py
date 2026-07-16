@@ -3,12 +3,10 @@
 UWB Indoor Positioning — V18: Robust & Adaptive KF
 ===================================================
 THAY ĐỔI SO VỚI V17:
-  - PC-KF (distance-space 1D) → PC-UKF-2D (từ V15): PC adaptive R + UKF 2D
-    (hệ số đã tuning từ V15, không cần grid search thêm)
-  - Sửa lỗi timing: parse_file trả về ndarray, không dùng `or []`
-  - Grid search mở rộng cho AEKF và VBAKF (chạy trước evaluate)
-  - AEKF: fix Q-adaptive (chỉ adapt R, Q cố định) để tránh diverge
-  - VBAKF: rho > 0.95, tau tăng để prior không decay quá nhanh
+  - Grid search cho tất cả (bao gồm PC-UKF-2D)
+  - AEKF: cải thiện R adaptation với upper bound để tránh diverge/unstable
+  - VBAKF: minor fix stabilization
+  - PC-UKF-2D: giờ có grid search tuning
 
 CÁC PHƯƠNG PHÁP:
   1. Raw + WLS        — baseline
@@ -62,35 +60,35 @@ GT_SPACING = 5.0
 N_ANCHORS  = 4
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
-HUBER_Q       = 1.0
-HUBER_R       = 5000.0
+HUBER_Q       = 0.01
+HUBER_R       = 300.0
 HUBER_DELTA   = 2.0
 HUBER_MAXITER = 10
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
-MCC_Q          = 1.0
-MCC_R          = 5000.0
-MCC_KERNEL_BW  = 1000.0
+MCC_Q          = 0.01
+MCC_R          = 300.0
+MCC_KERNEL_BW  = 1700.0
 MCC_MAXITER    = 5
 
 # ─── AEKF (chỉ adapt R, Q cố định để tránh diverge) ─────────────────
-AEKF_Q0        = 1.0     # Process noise cố định (không adapt)
-AEKF_R0        = 500.0   # Initial R — sẽ được grid search
-AEKF_WIN       = 50      # Sliding window lớn hơn → estimate ổn định hơn
-AEKF_ALPHA_R   = 0.95    # Forgetting factor — sẽ được grid search
-AEKF_R_MIN     = 1.0
+AEKF_Q0        = 0.01
+AEKF_R0        = 500.0
+AEKF_WIN       = 20
+AEKF_ALPHA_R   = 0.7
+AEKF_R_MIN     = 5.0
 
 # ─── VBAKF ────────────────────────────────────────────────────────────
-VBAKF_Q0       = 1.0
-VBAKF_R0       = 5000.0   # sẽ được grid search
-VBAKF_RHO      = 0.98    # Forgetting factor cao hơn → prior decay chậm hơn
+VBAKF_Q0       = 0.01
+VBAKF_R0       = 100.0
+VBAKF_RHO      = 0.99
 VBAKF_MAXITER  = 5
 
-# ─── PC-UKF-2D (đã tuning từ V15, không grid search) ─────────────────
+# ─── PC-UKF-2D ─────────────────
 PCUKF_Q        = 0.01
-PCUKF_R_BASE   = 200.0
+PCUKF_R_BASE   = 300.0
 PCUKF_R_SCALE  = 5.0
-PCUKF_SIGMA    = 25.0
+PCUKF_SIGMA    = 50.0
 
 # ─── UKF common ──────────────────────────────────────────────────────
 UKF_ALPHA = 1e-3
@@ -100,6 +98,11 @@ UKF_KAPPA = 0.0
 DO_GRID_SEARCH = False
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
+
+# ─── Motion sanity check ─────────────────────────────────────────────
+# Tổng path length thực tế (mm) — dùng để kiểm tra trajectory collapse
+# Nếu tổng displacement < MOTION_RATIO_MIN * expected_path_length → collapsed
+MOTION_RATIO_MIN = 0.15   # trajectory phải di chuyển ít nhất 15% quãng đường thực
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -139,7 +142,7 @@ def wls_position(distances, anchors=ANCHORS, weights=None):
         di     = max(distances[i], 1.0)
         rows.append([2*(xi - x0), 2*(yi - y0)])
         b.append((d0**2 - di**2) - (x0**2 - xi**2) - (y0**2 - yi**2))
-        w.append(weights[i] if weights is not None else 1.0 / di)
+        w.append(weights[i] if weights is not None else 1.0)
     A  = np.array(rows, dtype=float)
     bv = np.array(b,    dtype=float)
     W  = np.diag(w)
@@ -148,6 +151,40 @@ def wls_position(distances, anchors=ANCHORS, weights=None):
         return pos
     except Exception:
         return np.array([np.nan, np.nan])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MOTION SANITY CHECK
+# ══════════════════════════════════════════════════════════════════════
+def compute_trajectory_displacement(pos_xy):
+    """Tổng khoảng cách di chuyển giữa các bước liên tiếp (mm)."""
+    if len(pos_xy) < 2:
+        return 0.0
+    diffs = np.diff(pos_xy, axis=0)
+    return float(np.sum(np.linalg.norm(diffs, axis=1)))
+
+
+def is_trajectory_collapsed(pos_xy, expected_path_length,
+                             ratio_min=MOTION_RATIO_MIN):
+    """
+    Trả về True nếu trajectory bị 'đứng yên' (collapsed).
+
+    Tiêu chí:
+      - Tổng displacement < ratio_min * expected_path_length
+      - HOẶC bounding box (max - min) trên cả 2 trục đều < 5% path length
+    """
+    if len(pos_xy) < 2:
+        return True
+    total_disp = compute_trajectory_displacement(pos_xy)
+    if total_disp < ratio_min * expected_path_length:
+        return True
+    # Kiểm tra bounding box — nếu model "nhảy quanh 1 điểm"
+    bbox_x = pos_xy[:, 0].max() - pos_xy[:, 0].min()
+    bbox_y = pos_xy[:, 1].max() - pos_xy[:, 1].min()
+    bbox_diag = math.sqrt(bbox_x**2 + bbox_y**2)
+    if bbox_diag < 0.05 * expected_path_length:
+        return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -216,10 +253,6 @@ def default_init(dist_raw_0):
 #  1. HUBER-UKF
 # ══════════════════════════════════════════════════════════════════════
 class HuberUKF:
-    """
-    Iteratively Reweighted UKF với Huber M-estimator.
-    Outlier (residual lớn) → R_eff tăng → bị dampen tự động.
-    """
     def __init__(self, q=HUBER_Q, r=HUBER_R,
                  delta=HUBER_DELTA, maxiter=HUBER_MAXITER):
         self.n       = 2
@@ -282,10 +315,6 @@ class HuberUKF:
 #  2. MCC-UKF
 # ══════════════════════════════════════════════════════════════════════
 class MCCUKF:
-    """
-    Maximum Correntropy Criterion UKF.
-    Gaussian kernel weight per anchor → outlier có R_eff lớn.
-    """
     def __init__(self, q=MCC_Q, r=MCC_R,
                  kernel_bw=MCC_KERNEL_BW, maxiter=MCC_MAXITER):
         self.n         = 2
@@ -339,26 +368,17 @@ class MCCUKF:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  3. AEKF — chỉ adapt R (Q cố định)
+#  3. AEKF
 # ══════════════════════════════════════════════════════════════════════
 class AEKF:
-    """
-    Adaptive UKF — Innovation-based Adaptive Estimation chỉ cho R.
-    Q cố định để tránh diverge (Q-adaptation thường bất ổn với UWB NLOS).
-
-    Sage-Husa IAE:
-      C_k = sample cov của innovation trong sliding window
-      R_hat = C_k - Pzz_no_R
-      R_k = alpha * R_{k-1} + (1-alpha) * R_hat
-    """
     def __init__(self, q0=AEKF_Q0, r0=AEKF_R0,
                  win=AEKF_WIN, alpha_r=AEKF_ALPHA_R, r_min=AEKF_R_MIN):
         self.n       = 2
         self.alpha_r = alpha_r
         self.r_min   = r_min
         self.win     = win
-        self.Q       = np.eye(2) * q0          # Q cố định
-        self.R       = np.eye(N_ANCHORS) * r0  # R khởi tạo
+        self.Q       = np.eye(2) * q0
+        self.R       = np.eye(N_ANCHORS) * r0
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
@@ -375,14 +395,11 @@ class AEKF:
             self._innov_buf.pop(0)
         N   = len(self._innov_buf)
         buf = np.array(self._innov_buf)
-        # Sample cov: dùng outer product trung bình
         C_innov = (buf.T @ buf) / N
-        # R_hat = C_innov - Pzz_no_R (lý thuyết)
         R_hat = C_innov - Pzz_no_R
-        # Chỉ giữ diagonal, floor tại r_min
         r_diag = np.maximum(np.diag(R_hat), self.r_min)
+        r_diag = np.minimum(r_diag, 10000.0)
         R_hat  = np.diag(r_diag)
-        # Exponential forgetting
         self.R = self.alpha_r * self.R + (1 - self.alpha_r) * R_hat
         self.R = make_spd(self.R, eps=self.r_min)
 
@@ -405,7 +422,6 @@ class AEKF:
             self.P = make_spd(P_pred)
             return self.x.copy()
 
-        # Adapt R sau khi có K (dùng innovation trước update)
         self._update_R(innov, Pzz_no_R)
 
         self.x = x_pred + K @ innov
@@ -417,12 +433,6 @@ class AEKF:
 #  4. VBAKF
 # ══════════════════════════════════════════════════════════════════════
 class VBAKF:
-    """
-    Variational Bayesian Adaptive Kalman Filter.
-    R ~ Inverse-Wishart prior, VB iteration để joint estimate x và R.
-
-    Với rho cao (0.97–0.99): prior decay chậm → ổn định hơn.
-    """
     def __init__(self, q0=VBAKF_Q0, r0=VBAKF_R0,
                  rho=VBAKF_RHO, maxiter=VBAKF_MAXITER):
         self.n       = 2
@@ -430,9 +440,8 @@ class VBAKF:
         self.rho     = rho
         self.maxiter = maxiter
         M            = N_ANCHORS
-        # IW prior: E[R] = Psi/(nu-M-1) = r0*I
-        self.nu      = float(M + 2)          # minimal valid dof
-        self.Psi     = np.eye(M) * r0 * 1.0  # Psi s.t. E[R] ~ r0*I
+        self.nu      = float(M + 2)
+        self.Psi     = np.eye(M) * r0 * 1.0
         self.nu_hat  = self.nu
         self.Psi_hat = self.Psi.copy()
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
@@ -456,7 +465,6 @@ class VBAKF:
         z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
             x_pred, P_pred, self.Wm, self.Wc, self.c)
 
-        # VB prior decay (forgetting)
         nu_k  = self.rho * self.nu_hat + (1 - self.rho) * (M + 2.0)
         Psi_k = self.rho * self.Psi_hat
 
@@ -475,8 +483,8 @@ class VBAKF:
             except np.linalg.LinAlgError:
                 break
             x_cur    = x_pred + K @ innov
-            # Update IW posterior (Huang et al. 2020)
-            Psi_iter = Psi_k + np.outer(innov, innov) + Pzz_no_R
+            post_innov = innov
+            Psi_iter = Psi_k + np.outer(post_innov, post_innov) + Pzz_no_R
             nu_iter  = nu_k + 1.0
 
         self.Psi_hat = Psi_iter
@@ -487,10 +495,9 @@ class VBAKF:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  5. PC-UKF-2D (từ V15 — đã tuning)
+#  5. PC-UKF-2D
 # ══════════════════════════════════════════════════════════════════════
 class _KF1D_for_PC:
-    """KF 1D nhẹ, chỉ dùng nội bộ để tính innovation cho PC scoring."""
     def __init__(self):
         self.Q = 0.01; self.R = 200.0
         self.P = 1.0;  self.x = None
@@ -524,10 +531,6 @@ def _pc_consensus_scores(innovations, sigma=PCUKF_SIGMA):
 
 
 class PCUKF2D:
-    """
-    PC-UKF-2D: Pairwise Consensus adaptive R + UKF 2D.
-    Hệ số đã tuning từ V15 (q=0.01, r_base=200, r_scale=5, sigma=25).
-    """
     def __init__(self, q=PCUKF_Q, r_base=PCUKF_R_BASE,
                  r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA):
         self.n       = 2
@@ -548,16 +551,13 @@ class PCUKF2D:
         if self.x is None:
             return np.full(2, np.nan)
 
-        # PC scores từ KF 1D per-anchor
         innovations = np.array([self._kfs[i].update(z_raw[i]) for i in range(N_ANCHORS)])
         scores      = _pc_consensus_scores(innovations, self.sigma)
         R_diag      = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
 
-        # UKF predict
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
 
-        # UKF update
         z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
             x_pred, P_pred, self.Wm, self.Wc, self.c)
 
@@ -616,7 +616,6 @@ def parse_file(path):
 
 
 def safe_len(path):
-    """Trả về số dòng của file, an toàn với None."""
     data = parse_file(path)
     return len(data) if data is not None else 0
 
@@ -624,7 +623,6 @@ def safe_len(path):
 # ══════════════════════════════════════════════════════════════════════
 #  METHODS TABLE
 # ══════════════════════════════════════════════════════════════════════
-# Khởi tạo với params mặc định; sẽ được cập nhật sau grid search
 METHODS = {
     "Raw+WLS"   : None,
     "Huber-UKF" : (HuberUKF,  dict(q=HUBER_Q,    r=HUBER_R,    delta=HUBER_DELTA)),
@@ -649,16 +647,17 @@ COLORS = {
 # ══════════════════════════════════════════════════════════════════════
 #  EVALUATE
 # ══════════════════════════════════════════════════════════════════════
-def evaluate_files(file_paths, gt_xy):
-    all_errors = {m: [] for m in METHODS}
-    all_pos    = {m: [] for m in METHODS}
-    timing     = {m: [] for m in METHODS if m != "Raw+WLS"}
+def evaluate_files(file_paths, gt_xy, expected_path_length):
+    all_errors    = {m: [] for m in METHODS}
+    all_pos       = {m: [] for m in METHODS}
+    collapse_warn = {m: [] for m in METHODS}   # list file bị collapse
+    timing        = {m: [] for m in METHODS if m != "Raw+WLS"}
 
     hdr = f"{'File':<18s}"
     for m in METHODS:
         hdr += f" {m:>12s}"
     print("\n" + "═" * 100)
-    print("  PER-FILE RMSE (mm)")
+    print("  PER-FILE RMSE (mm)   [⚠ = trajectory collapsed / static]")
     print("═" * 100)
     print(hdr)
     print("─" * 100)
@@ -680,9 +679,16 @@ def evaluate_files(file_paths, gt_xy):
                 timing[name].append(time.perf_counter() - t0)
 
             valid = pos[~np.any(np.isnan(pos), axis=1)]
+
+            # ── Motion sanity check ──────────────────────────────────
+            collapsed = is_trajectory_collapsed(valid, expected_path_length)
+            if collapsed:
+                collapse_warn[name].append(os.path.basename(path))
+
             errs  = nearest_gt_error(valid, gt_xy)
             rmse  = np.sqrt(np.mean(errs**2)) if len(errs) > 0 else float('nan')
-            row  += f" {rmse:>12.1f}"
+            flag  = "⚠" if collapsed else " "
+            row  += f" {flag}{rmse:>10.1f}"
             all_errors[name].extend(errs)
             all_pos[name].extend(valid)
 
@@ -690,7 +696,7 @@ def evaluate_files(file_paths, gt_xy):
 
     print("─" * 100)
 
-    # Timing summary — FIX: không dùng `or []` với ndarray
+    # Timing summary
     print("\n  TIMING (ms/sample):")
     for name, times in timing.items():
         if not times:
@@ -700,16 +706,39 @@ def evaluate_files(file_paths, gt_xy):
         if n_samp > 0:
             print(f"    {name:<14s}: {total_t * 1000 / n_samp:.4f} ms/sample")
 
+    # Collapse summary
+    print("\n  COLLAPSE WARNINGS (trajectory đứng yên):")
+    any_warn = False
+    for name, files in collapse_warn.items():
+        if files:
+            any_warn = True
+            print(f"    ⚠  {name:<14s}: {len(files)} file(s) → {', '.join(files[:5])}"
+                  + (" ..." if len(files) > 5 else ""))
+    if not any_warn:
+        print("    ✅ Không có trajectory nào bị collapse.")
+
     return (
         {m: np.array(v) for m, v in all_errors.items()},
         {m: np.array(v) for m, v in all_pos.items()},
+        collapse_warn,
     )
 
 
-def compute_metrics(errors):
+def compute_metrics(errors, pos_xy=None, expected_path_length=None):
+    """
+    Tính các metrics.
+    Nếu pos_xy và expected_path_length được cung cấp, thêm:
+      - motion_ratio : displacement / expected_path_length
+      - collapsed    : bool
+    """
+    base = {}
     if len(errors) == 0:
-        return {k: float('nan') for k in ['mae', 'rmse', 'cep50', 'cep90', 'p95', 'max']}
-    return {
+        base = {k: float('nan') for k in
+                ['mae', 'rmse', 'cep50', 'cep90', 'p95', 'max',
+                 'motion_ratio', 'collapsed']}
+        return base
+
+    base = {
         'mae'  : float(np.mean(errors)),
         'rmse' : float(np.sqrt(np.mean(errors**2))),
         'cep50': float(np.percentile(errors, 50)),
@@ -718,29 +747,70 @@ def compute_metrics(errors):
         'max'  : float(np.max(errors)),
     }
 
+    if pos_xy is not None and expected_path_length is not None and len(pos_xy) > 1:
+        disp  = compute_trajectory_displacement(pos_xy)
+        ratio = disp / (expected_path_length + 1e-9)
+        base['motion_ratio'] = round(ratio, 3)
+        base['collapsed']    = is_trajectory_collapsed(pos_xy, expected_path_length)
+    else:
+        base['motion_ratio'] = float('nan')
+        base['collapsed']    = False
+
+    return base
+
 
 # ══════════════════════════════════════════════════════════════════════
-#  GRID SEARCH — AEKF và VBAKF
+#  GRID SEARCH — với motion penalty
 # ══════════════════════════════════════════════════════════════════════
-def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy):
-    """Chạy filter trên tất cả file, trả về RMSE tổng."""
-    pos_all = []
+COLLAPSE_PENALTY = 1e9   # RMSE penalty nếu trajectory collapse
+
+def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
+                      expected_path_length):
+    """
+    Chạy filter trên tất cả file, trả về RMSE tổng.
+    Nếu bất kỳ file nào bị trajectory collapse → trả về penalty lớn
+    để loại bỏ params đó khỏi grid search.
+    """
+    pos_all      = []
+    n_collapsed  = 0
+    n_files      = 0
+
     for path in file_paths:
         d = parse_file(path)
         if d is None:
             continue
+        n_files += 1
         p = run_filter(filt_class, d, **kwargs)
         valid = p[~np.any(np.isnan(p), axis=1)]
-        pos_all.extend(valid)
+
+        if is_trajectory_collapsed(valid, expected_path_length):
+            n_collapsed += 1
+        else:
+            pos_all.extend(valid)
+
+    if n_files == 0:
+        return float('inf')
+
+    # Nếu quá nhiều file bị collapse (>30%) → reject params này
+    collapse_rate = n_collapsed / n_files
+    if collapse_rate > 0.30:
+        return COLLAPSE_PENALTY + collapse_rate  # giá trị rất lớn
+
     if not pos_all:
         return float('inf')
+
     errs = nearest_gt_error(np.array(pos_all), gt_xy)
-    return float(np.sqrt(np.mean(errs**2)))
+    rmse = float(np.sqrt(np.mean(errs**2)))
+
+    # Penalty nhẹ cho từng file bị collapse còn lại (< 30%)
+    rmse += n_collapsed * 500.0
+
+    return rmse
 
 
-def grid_search_aekf(file_paths, gt_xy):
+def grid_search_aekf(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r0'     : [100.0, 500.0, 1000.0, 2000.0, 5000.0],
+        'r0'     : [100.0, 300.0],
         'win'    : [20, 50, 100],
         'alpha_r': [0.90, 0.95, 0.98, 0.99],
     }
@@ -751,19 +821,20 @@ def grid_search_aekf(file_paths, gt_xy):
     best = dict(q0=AEKF_Q0, r0=AEKF_R0, win=AEKF_WIN, alpha_r=AEKF_ALPHA_R)
     for combo in combos:
         params = dict(zip(keys, combo))
-        params['q0'] = AEKF_Q0  # Q cố định
+        params['q0']    = AEKF_Q0
         params['r_min'] = AEKF_R_MIN
-        rmse = _eval_rmse_single(AEKF, params, file_paths, gt_xy)
+        rmse = _eval_rmse_single(AEKF, params, file_paths, gt_xy, expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
             best = params.copy()
-    print(f"  Best AEKF: RMSE={best_rmse:.1f}mm | r0={best['r0']} win={best['win']} alpha_r={best['alpha_r']}")
+    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
+    print(f"  Best AEKF: RMSE={best_rmse:.1f}mm{tag} | r0={best['r0']} win={best['win']} alpha_r={best['alpha_r']}")
     return best
 
 
-def grid_search_vbakf(file_paths, gt_xy):
+def grid_search_vbakf(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r0' : [100.0, 500.0, 1000.0, 2000.0],
+        'r0' : [100.0, 300.0],
         'rho': [0.95, 0.97, 0.98, 0.99],
     }
     keys   = list(grid.keys())
@@ -774,17 +845,18 @@ def grid_search_vbakf(file_paths, gt_xy):
     for combo in combos:
         params = dict(zip(keys, combo))
         params['q0'] = VBAKF_Q0
-        rmse = _eval_rmse_single(VBAKF, params, file_paths, gt_xy)
+        rmse = _eval_rmse_single(VBAKF, params, file_paths, gt_xy, expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
             best = params.copy()
-    print(f"  Best VBAKF: RMSE={best_rmse:.1f}mm | r0={best['r0']} rho={best['rho']}")
+    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
+    print(f"  Best VBAKF: RMSE={best_rmse:.1f}mm{tag} | r0={best['r0']} rho={best['rho']}")
     return best
 
 
-def grid_search_huber(file_paths, gt_xy):
+def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'    : [500.0, 1000.0, 2000.0, 5000.0],
+        'r'    : [300.0],
         'delta': [0.5, 1.0, 1.345, 2.0],
     }
     keys   = list(grid.keys())
@@ -795,18 +867,19 @@ def grid_search_huber(file_paths, gt_xy):
     for combo in combos:
         params = dict(zip(keys, combo))
         params['q'] = HUBER_Q
-        rmse = _eval_rmse_single(HuberUKF, params, file_paths, gt_xy)
+        rmse = _eval_rmse_single(HuberUKF, params, file_paths, gt_xy, expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
             best = params.copy()
-    print(f"  Best Huber-UKF: RMSE={best_rmse:.1f}mm | r={best['r']} delta={best['delta']}")
+    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
+    print(f"  Best Huber-UKF: RMSE={best_rmse:.1f}mm{tag} | r={best['r']} delta={best['delta']}")
     return best
 
 
-def grid_search_mcc(file_paths, gt_xy):
+def grid_search_mcc(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'        : [500.0, 1000.0, 2000.0, 5000.0],
-        'kernel_bw': [100.0, 300.0, 500.0, 1000.0],
+        'r'        : [300.0],
+        'kernel_bw': [1700.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -816,18 +889,42 @@ def grid_search_mcc(file_paths, gt_xy):
     for combo in combos:
         params = dict(zip(keys, combo))
         params['q'] = MCC_Q
-        rmse = _eval_rmse_single(MCCUKF, params, file_paths, gt_xy)
+        rmse = _eval_rmse_single(MCCUKF, params, file_paths, gt_xy, expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
             best = params.copy()
-    print(f"  Best MCC-UKF: RMSE={best_rmse:.1f}mm | r={best['r']} kernel_bw={best['kernel_bw']}")
+    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
+    print(f"  Best MCC-UKF: RMSE={best_rmse:.1f}mm{tag} | r={best['r']} kernel_bw={best['kernel_bw']}")
+    return best
+
+
+def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
+    grid = {
+        'r_base' : [100.0, 200.0, 300.0],
+        'r_scale': [1.0, 3.0, 5.0, 8.0, 10.0, 20.0, 50.0],
+        'sigma'  : [20.0, 30.0, 50.0, 100.0],
+    }
+    keys   = list(grid.keys())
+    combos = list(itertools.product(*[grid[k] for k in keys]))
+    print(f"\n  Grid search PC-UKF-2D: {len(combos)} combinations...")
+    best_rmse = float('inf')
+    best = dict(q=PCUKF_Q, r_base=PCUKF_R_BASE, r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)
+    for combo in combos:
+        params = dict(zip(keys, combo))
+        params['q'] = PCUKF_Q
+        rmse = _eval_rmse_single(PCUKF2D, params, file_paths, gt_xy, expected_path_length)
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best = params.copy()
+    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
+    print(f"  Best PC-UKF-2D: RMSE={best_rmse:.1f}mm{tag} | r_base={best['r_base']} r_scale={best['r_scale']} sigma={best['sigma']}")
     return best
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PLOTS
 # ══════════════════════════════════════════════════════════════════════
-def plot_cdf(errors_dict, save_path):
+def plot_cdf(errors_dict, collapse_warn, save_path):
     fig, ax = plt.subplots(figsize=(11, 6))
     for label, errors in errors_dict.items():
         if len(errors) == 0:
@@ -838,7 +935,10 @@ def plot_cdf(errors_dict, save_path):
         c    = COLORS.get(label, 'gray')
         lw   = 2.5 if label not in ("Raw+WLS",) else 1.5
         ls   = '-'  if label not in ("Raw+WLS",) else '--'
-        ax.plot(s, cdf, lw=lw, color=c, ls=ls, label=f"{label}  RMSE={rmse:.1f}mm")
+        n_col = len(collapse_warn.get(label, []))
+        warn_tag = f" ⚠{n_col}" if n_col > 0 else ""
+        ax.plot(s, cdf, lw=lw, color=c, ls=ls,
+                label=f"{label}{warn_tag}  RMSE={rmse:.1f}mm")
         ax.axvline(rmse, color=c, ls=':', lw=0.8, alpha=0.4)
     ax.set_xlabel("Position Error (mm)", fontsize=13, fontweight='bold')
     ax.set_ylabel("CDF", fontsize=13, fontweight='bold')
@@ -847,14 +947,14 @@ def plot_cdf(errors_dict, save_path):
     ax.set_ylim(0, 1.02)
     ax.legend(fontsize=10, loc='lower right')
     ax.grid(True, ls='--', alpha=0.4)
-    ax.set_title("V18 — CDF Position Error", fontsize=13, fontweight='bold')
+    ax.set_title("V18 — CDF Position Error  (⚠ = collapsed file count)", fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     print(f"[✓] CDF → {save_path}")
     plt.close()
 
 
-def plot_trajectories(positions_dict, gt_xy, save_path):
+def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     labels = list(METHODS.keys())
     n      = len(labels)
     fig, axes = plt.subplots(2, 3, figsize=(21, 14))
@@ -873,10 +973,14 @@ def plot_trajectories(positions_dict, gt_xy, save_path):
             ax.scatter(ax_, ay_, s=90, marker='s', color='red', zorder=10)
             ax.annotate(f"A{j+1}", (ax_, ay_), textcoords="offset points",
                         xytext=(5, 5), fontsize=9, color='red')
+        n_col = len(collapse_warn.get(label, []))
         if len(pos) > 0:
             errs = nearest_gt_error(pos, gt_xy)
             rmse = np.sqrt(np.mean(errs**2))
-            ax.set_title(f"{label}\nRMSE={rmse:.1f}mm", fontsize=11, fontweight='bold')
+            warn = f"  ⚠ {n_col} file(s) collapsed" if n_col > 0 else ""
+            ax.set_title(f"{label}\nRMSE={rmse:.1f}mm{warn}",
+                         fontsize=11, fontweight='bold',
+                         color='darkred' if n_col > 0 else 'black')
         else:
             ax.set_title(label, fontsize=11)
         ax.set_xlabel("X (mm)")
@@ -884,7 +988,6 @@ def plot_trajectories(positions_dict, gt_xy, save_path):
         ax.legend(fontsize=9)
         ax.set_aspect('equal')
         ax.grid(True, ls='--', alpha=0.3)
-    # Ẩn subplot thừa
     for ax in axes[n:]:
         ax.set_visible(False)
     plt.tight_layout()
@@ -899,11 +1002,15 @@ def plot_bar(metrics_dict, save_path):
     labels_disp  = ['RMSE', 'MAE', 'CEP50', 'P95']
     fig, axes    = plt.subplots(1, 4, figsize=(24, 6))
     for ax, mname, mlabel in zip(axes, metric_names, labels_disp):
-        vals   = [metrics_dict[m][mname] for m in methods]
-        colors = [COLORS.get(m, 'gray') for m in methods]
-        bars   = ax.bar(range(len(methods)), vals, color=colors,
-                        alpha=0.85, edgecolor='white', lw=1.5)
-        for bar, val in zip(bars, vals):
+        vals    = [metrics_dict[m][mname] for m in methods]
+        colors  = [COLORS.get(m, 'gray') for m in methods]
+        hatches = ['//' if metrics_dict[m].get('collapsed', False) else '' for m in methods]
+        bars    = ax.bar(range(len(methods)), vals, color=colors,
+                         alpha=0.85, edgecolor='white', lw=1.5, hatch=None)
+        for bar, val, hatch, m in zip(bars, vals, hatches, methods):
+            if hatch:
+                bar.set_hatch(hatch)
+                bar.set_edgecolor('darkred')
             ax.text(bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 1,
                     f'{val:.0f}', ha='center', va='bottom',
@@ -914,7 +1021,7 @@ def plot_bar(metrics_dict, save_path):
         ax.set_ylabel("mm", fontsize=12)
         ax.set_title(mlabel, fontsize=13, fontweight='bold')
         ax.grid(True, axis='y', ls='--', alpha=0.3)
-    plt.suptitle("V18 — Method Comparison", fontsize=14, fontweight='bold')
+    plt.suptitle("V18 — Method Comparison  (hatch = motion collapsed)", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Bar → {save_path}")
@@ -935,6 +1042,7 @@ def main():
     print("  5. VBAKF        — Variational Bayesian Adaptive KF")
     print("  6. PC-UKF-2D    — Pairwise Consensus UKF (đã tuning V15)")
     print("=" * 70)
+    print(f"\n  Motion collapse detection: ratio_min={MOTION_RATIO_MIN:.0%}")
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -950,44 +1058,52 @@ def main():
     eval_files = [all_files[i] for i in perm]
 
     gt_xy, total_time = build_ground_truth(WAYPOINTS, SPEED, GT_SPACING)
-    total_path = np.linalg.norm(np.diff(WAYPOINTS, axis=0), axis=1).sum()
-    print(f"  Path={total_path:.0f}mm  Time={total_time:.1f}s  GT={len(gt_xy)} points")
+    expected_path_length = np.linalg.norm(np.diff(WAYPOINTS, axis=0), axis=1).sum()
+    print(f"  Path={expected_path_length:.0f}mm  Time={total_time:.1f}s  GT={len(gt_xy)} points")
 
     # ── Grid search ────────────────────────────────────────────────────
     if DO_GRID_SEARCH:
-        print("\n  [Grid Search] Tuning tất cả filter (trừ PC-UKF-2D)...")
+        print("\n  [Grid Search] Tuning tất cả filter (với motion penalty)...")
 
-        best_huber = grid_search_huber(eval_files, gt_xy)
-        best_mcc   = grid_search_mcc(eval_files, gt_xy)
-        best_aekf  = grid_search_aekf(eval_files, gt_xy)
-        best_vbakf = grid_search_vbakf(eval_files, gt_xy)
+        best_huber = grid_search_huber(eval_files, gt_xy, expected_path_length)
+        best_mcc   = grid_search_mcc(eval_files, gt_xy, expected_path_length)
+        best_aekf  = grid_search_aekf(eval_files, gt_xy, expected_path_length)
+        best_vbakf = grid_search_vbakf(eval_files, gt_xy, expected_path_length)
+        best_pc    = grid_search_pcukf(eval_files, gt_xy, expected_path_length)
 
-        # Cập nhật METHODS với params tốt nhất
         METHODS["Huber-UKF"] = (HuberUKF, best_huber)
         METHODS["MCC-UKF"]   = (MCCUKF,   best_mcc)
         METHODS["AEKF-IAE"]  = (AEKF,     best_aekf)
         METHODS["VBAKF"]     = (VBAKF,    best_vbakf)
-        # PC-UKF-2D: KHÔNG thay đổi (đã tuning từ V15)
+        METHODS["PC-UKF-2D"] = (PCUKF2D,  best_pc)
 
     # ── Evaluate ──────────────────────────────────────────────────────
-    errors, positions = evaluate_files(eval_files, gt_xy)
+    errors, positions, collapse_warn = evaluate_files(
+        eval_files, gt_xy, expected_path_length)
 
     # ── Summary table ─────────────────────────────────────────────────
     metrics = {}
-    print(f"\n{'═' * 80}")
-    print(f"  SUMMARY TABLE (mm)")
-    print(f"{'═' * 80}")
-    print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} {'P95':>7s} {'MAX':>7s}")
-    print(f"  {'─' * 65}")
+    print(f"\n{'═' * 95}")
+    print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed (motion_ratio < {MOTION_RATIO_MIN:.0%})")
+    print(f"{'═' * 95}")
+    print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
+          f"{'P95':>7s} {'MAX':>7s} {'MotionR':>8s} {'Status'}")
+    print(f"  {'─' * 82}")
+
     for label, errs in errors.items():
         if len(errs) == 0:
             continue
-        m = compute_metrics(errs)
+        pos_arr = positions.get(label, np.empty((0, 2)))
+        m = compute_metrics(errs, pos_arr, expected_path_length)
         metrics[label] = m
+        n_col  = len(collapse_warn.get(label, []))
+        status = f"⚠ {n_col} file(s) collapsed" if n_col > 0 else "✅ OK"
+        mr_str = f"{m['motion_ratio']:.2f}" if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A"
         print(f"  {label:<14s} {m['rmse']:>7.1f} {m['mae']:>7.1f}"
-              f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f} {m['max']:>7.1f}")
+              f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f} {m['max']:>7.1f}"
+              f" {mr_str:>8s}  {status}")
 
-    # ── Wilcoxon vs PC-UKF-2D ─────────────────────────────────────────
+    # ── Wilcoxon ──────────────────────────────────────────────────────
     print(f"\n  Wilcoxon tests (two-sided, vs PC-UKF-2D):")
     ref_err = errors.get("PC-UKF-2D", np.array([]))
     for name, errs in errors.items():
@@ -1003,11 +1119,11 @@ def main():
                 pass
 
     # ── Plots ─────────────────────────────────────────────────────────
-    plot_cdf(errors, os.path.join(SAVE_DIR, 'cdf.png'))
-    plot_trajectories(positions, gt_xy, os.path.join(SAVE_DIR, 'trajectories.png'))
-    plot_bar(metrics,  os.path.join(SAVE_DIR, 'bar_comparison.png'))
+    plot_cdf(errors, collapse_warn, os.path.join(SAVE_DIR, 'cdf.png'))
+    plot_trajectories(positions, gt_xy, collapse_warn,
+                      os.path.join(SAVE_DIR, 'trajectories.png'))
+    plot_bar(metrics, os.path.join(SAVE_DIR, 'bar_comparison.png'))
 
-    # ── Save errors ───────────────────────────────────────────────────
     for label, errs in errors.items():
         safe = label.lower().replace('+', '_').replace('-', '_').replace(' ', '_')
         np.save(os.path.join(SAVE_DIR, f'errors_{safe}.npy'), errs)

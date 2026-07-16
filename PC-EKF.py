@@ -60,13 +60,13 @@ N_ANCHORS  = 4
 
 # EKF-2D params
 EKF2D_Q     = 0.01    # Process noise (mm^2) — scalar, dùng cho I*Q
-EKF2D_R     = 200.0  # Measurement noise (mm^2) per anchor
+EKF2D_R     = 300.0  # Measurement noise (mm^2) per anchor
 
 # PC-EKF-2D params
 PCEKF2D_Q       = 0.01
-PCEKF2D_R_BASE  = 200.0
-PCEKF2D_R_SCALE = 5.0
-PCEKF2D_SIGMA   = 25.0
+PCEKF2D_R_BASE  = 300.0
+PCEKF2D_R_SCALE = 20.0
+PCEKF2D_SIGMA   = 200.0
 
 # PC scoring dùng KF 1D để tính innovation (giống V13a)
 PC_KF_Q = 0.01
@@ -179,21 +179,29 @@ class _KF1D_for_PC:
         return innovation
 
 
-def pc_consensus_scores(innovations, sigma=PCEKF2D_SIGMA):
-    """
-    Tính consensus score từ innovation của mỗi anchor.
-    Score cao = anchor tin cậy, score thấp = anchor bị nhiễu/lỗi.
-    """
-    innov = np.abs(innovations)
+def pc_consensus_scores(innovations, sigma=PCEKF2D_SIGMA, d_raw=None):
+    # dùng residual nếu có d_raw, fallback về innovation
+    if d_raw is not None:
+        pos_est = wls_position(d_raw)
+        if not np.any(np.isnan(pos_est)):
+            residual = np.zeros(N_ANCHORS)
+            for i, (ax, ay) in enumerate(ANCHORS):
+                d_est = math.sqrt((pos_est[0]-ax)**2 + (pos_est[1]-ay)**2)
+                residual[i] = abs(d_raw[i] - d_est)
+        else:
+            residual = np.abs(innovations)
+    else:
+        residual = np.abs(innovations)
+
     scores = np.zeros(N_ANCHORS)
     eps = 1e-9
     for i in range(N_ANCHORS):
         s = 0.0; cnt = 0
         for j in range(N_ANCHORS):
             if i == j: continue
-            diff = innov[i] - innov[j]
+            diff = residual[i] - residual[j]
             nu = 4.0
-            c = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu + 1.0) / 2.0)
+            c = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu+1.0)/2.0)
             s += c; cnt += 1
         scores[i] = s / cnt
     return scores
@@ -293,7 +301,7 @@ class PCEKF2D:
         innovations = np.array([self._kfs[i].update(z_raw[i]) for i in range(N_ANCHORS)])
 
         # Bước 2: PC consensus score → R adaptive
-        scores  = pc_consensus_scores(innovations, self.sigma)
+        scores = pc_consensus_scores(innovations, self.sigma, d_raw=z_raw)
         R_diag  = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
         R       = np.diag(R_diag)                # (N_ANCHORS, N_ANCHORS)
 
@@ -481,7 +489,7 @@ def compute_metrics(errors, label=""):
 # ══════════════════════════════════════════════════════════════════════
 def grid_search(val_files, gt_xy):
     grid = {
-        'q'      : [0.1, 1.0, 10.0],
+        'q'      : [0.1, 0.01],
         'r_base' : [50.0, 100.0, 200.0, 300.0],
         'r_scale': [5.0, 10.0, 20.0],
         'sigma'  : [50.0, 100.0, 200.0],
@@ -631,6 +639,59 @@ def analyze_scores(file_paths, q=PCEKF2D_Q, r_base=PCEKF2D_R_BASE,
     plt.close()
 
 
+def debug_pcekf(file_path, gt_xy, n_samples=20):
+    parsed = parse_file(file_path)
+    dist_raw = parsed['dist'].astype(float)
+
+    pcekf = PCEKF2D()
+    init_pos = wls_position(dist_raw[0])
+    pcekf.init(init_pos if not np.any(np.isnan(init_pos)) else np.array([2000.0, 4400.0]))
+
+    print("\n" + "═"*110)
+    print("DEBUG PC-EKF-2D — 20 samples đầu")
+    print("═"*110)
+    print(f"{'t':>4} | {'d_raw':>40} | {'innov':>40} | {'scores':>30} | {'R':>30}")
+    print("─"*110)
+
+    for t in range(min(n_samples, len(dist_raw))):
+        d = dist_raw[t]
+        innovations = np.array([
+            d[i] - pcekf._kfs[i].x if pcekf._kfs[i].x is not None else 0.0
+            for i in range(N_ANCHORS)
+        ])
+        scores = pc_consensus_scores(innovations, pcekf.sigma, d_raw=d)
+        R_diag = pcekf.R_base * (1.0 + pcekf.R_scale * (1.0 - scores))
+        pos, sc = pcekf.step(d)
+        print(f"{t:>4} | {str(np.round(d,1)):>40} | "
+              f"{str(np.round(np.abs(innovations),1)):>40} | "
+              f"{str(np.round(scores,3)):>30} | "
+              f"{str(np.round(R_diag,1)):>30}")
+
+    print("\n── Phân phối scores toàn bộ file ──")
+    pcekf2 = PCEKF2D()
+    init_pos = wls_position(dist_raw[0])
+    pcekf2.init(init_pos if not np.any(np.isnan(init_pos)) else np.array([2000.0, 4400.0]))
+
+    all_scores = []
+    all_R      = []
+    for t in range(len(dist_raw)):
+        _, sc = pcekf2.step(dist_raw[t])
+        R = pcekf2.R_base * (1.0 + pcekf2.R_scale * (1.0 - sc))
+        all_scores.append(sc)
+        all_R.append(R)
+    all_scores = np.array(all_scores)
+    all_R      = np.array(all_R)
+
+    print(f"  Score mean per anchor: {np.mean(all_scores, axis=0).round(3)}")
+    print(f"  Score std  per anchor: {np.std(all_scores,  axis=0).round(3)}")
+    print(f"  Score < 0.3 (nghi ngờ):  {(all_scores < 0.3).sum(axis=0)} lần")
+    print(f"  Score > 0.7 (tin tưởng): {(all_scores > 0.7).sum(axis=0)} lần")
+
+    print("\n── R adaptive distribution ──")
+    print(f"  R mean: {np.mean(all_R, axis=0).round(1)}")
+    print(f"  R min:  {np.min(all_R,  axis=0).round(1)}")
+    print(f"  R max:  {np.max(all_R,  axis=0).round(1)}")
+
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
@@ -669,6 +730,8 @@ def main():
     eval_files = test_files if test_files else val_files
     if not eval_files:
         eval_files = train_files if train_files else all_files
+
+    debug_pcekf(eval_files[0], gt_xy)
 
     print(f"\n{'═'*60}\n  Evaluating trên {len(eval_files)} files\n{'═'*60}")
     err, positions = evaluate_files(eval_files, gt_xy, **best_params)

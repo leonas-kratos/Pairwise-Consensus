@@ -54,13 +54,13 @@ N_ANCHORS      = 4
 
 # KF baseline params
 KF_Q = 0.01
-KF_R = 200.0
+KF_R = 300.0
 
 # PC-KF default params
 PCKF_Q       = 0.01
 PCKF_R_BASE  = 200.0
-PCKF_R_SCALE = 10.0    # R_i = R_base * (1 + r_scale * (1 - score_i))
-PCKF_SIGMA   = 200.0   # mm — ngưỡng innovation "bình thường"
+PCKF_R_SCALE = 20.0    # R_i = R_base * (1 + r_scale * (1 - score_i))
+PCKF_SIGMA   = 150.0   # mm — ngưỡng innovation "bình thường"
 
 DO_GRID_SEARCH  = True
 DATA_DIR = "./data"
@@ -148,20 +148,27 @@ class PCKF:
         self.x       = None
 
     def _consensus_scores(self, d_raw):
-        innov = np.abs(d_raw - self.x)
+        # Tính residual thay vì innovation
+        pos_est = wls_position(d_raw)
+        if np.any(np.isnan(pos_est)):
+            return np.ones(N_ANCHORS) * 0.5
+        
+        # Distance từ pos_est đến từng anchor (ground distance)
+        residual = np.zeros(N_ANCHORS)
+        for i, (ax, ay) in enumerate(ANCHORS):
+            d_est = math.sqrt((pos_est[0]-ax)**2 + (pos_est[1]-ay)**2)
+            residual[i] = abs(d_raw[i] - d_est)
+        
         scores = np.zeros(N_ANCHORS)
         eps = 1e-9
-
         for i in range(N_ANCHORS):
-            s = 0.0
-            cnt = 0
+            s = 0.0; cnt = 0
             for j in range(N_ANCHORS):
-                if i == j: continue 
-                diff = innov[i] - innov[j]
+                if i == j: continue
+                diff = residual[i] - residual[j]
                 nu = 4.0
-                c = (1.0 + (diff * diff) / (nu * self.sigma * self.sigma + eps)) ** (-(nu + 1.0) / 2.0)
-                s += c
-                cnt += 1
+                c = (1.0 + (diff**2) / (nu * self.sigma**2 + eps)) ** (-(nu+1.0)/2.0)
+                s += c; cnt += 1
             scores[i] = s / cnt
         return scores
 
@@ -326,8 +333,8 @@ def grid_search(val_files, gt_xy):
     grid = {
         'q'      : [0.001, 0.01],
         'r_base' : [10.0, 25.0, 50.0, 100.0, 200.0, 300.0],
-        'r_scale': [5.0, 10.0, 20.0],
-        'sigma'  : [10.0, 50.0, 100.0, 150.0, 200.0],
+        'r_scale': [1.0, 5.0, 10.0, 20.0],
+        'sigma'  : [1.0, 5.0, 10.0, 15.0, 20.0, 50.0, 100.0],
     }
 
     keys   = list(grid.keys())
@@ -476,6 +483,53 @@ def plot_bar(metrics_dict, save_path):
     plt.close()
 
 
+def debug_pckf(file_path, gt_xy, n_samples=20):
+    parsed = parse_file(file_path)
+    dist_raw = parsed['dist'].astype(float)
+    
+    kf = PCKF()
+    
+    print("\n" + "═"*100)
+    print("DEBUG PC-KF — 20 samples đầu")
+    print("═"*100)
+    print(f"{'t':>4} | {'d_raw':>40} | {'innov':>40} | {'scores':>30} | {'R':>30}")
+    print("─"*100)
+    
+    for t in range(min(n_samples, len(dist_raw))):
+        d = dist_raw[t]
+        
+        if kf.x is None:
+            kf.x = d.copy()
+            print(f"{t:>4} | INIT")
+            continue
+        
+        innov = np.abs(d - kf.x)
+        scores = kf._consensus_scores(d)
+        R = kf.R_base * (1.0 + kf.R_scale * (1.0 - scores))
+        
+        kf.update(d)
+        
+        print(f"{t:>4} | {str(np.round(d,1)):>40} | {str(np.round(innov,1)):>40} | {str(np.round(scores,3)):>30} | {str(np.round(R,1)):>30}")
+    
+    print("\n── Phân phối scores toàn bộ file ──")
+    kf2 = PCKF()
+    all_scores = []
+    for t in range(len(dist_raw)):
+        _, sc = kf2.update(dist_raw[t])
+        all_scores.append(sc)
+    all_scores = np.array(all_scores)
+    
+    print(f"  Score mean per anchor: {np.mean(all_scores, axis=0).round(3)}")
+    print(f"  Score std  per anchor: {np.std(all_scores,  axis=0).round(3)}")
+    print(f"  Score < 0.3 (nghi ngờ): {(all_scores < 0.3).sum(axis=0)} lần")
+    print(f"  Score > 0.7 (tin tưởng): {(all_scores > 0.7).sum(axis=0)} lần")
+    
+    print("\n── R adaptive distribution ──")
+    R_all = kf.R_base * (1.0 + kf.R_scale * (1.0 - all_scores))
+    print(f"  R mean: {np.mean(R_all, axis=0).round(1)}")
+    print(f"  R min:  {np.min(R_all,  axis=0).round(1)}")
+    print(f"  R max:  {np.max(R_all,  axis=0).round(1)}")
+
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
@@ -492,8 +546,8 @@ def main():
     import random; random.seed(42); np.random.seed(42)
     perm        = np.random.permutation(n)
     shuffled    = [all_files[i] for i in perm]
-    n_train     = min(4, n)
-    n_val       = min(2, max(0, n - n_train))
+    n_train     = min(0, n)
+    n_val       = min(6, max(0, n - n_train))
     train_files = shuffled[:n_train]
     val_files   = shuffled[n_train:n_train + n_val]
     test_files  = shuffled[n_train + n_val:]
@@ -528,6 +582,8 @@ def main():
     eval_files = test_files if test_files else val_files
     if not eval_files:
         eval_files = train_files
+
+    debug_pckf(eval_files[0], gt_xy)
 
     print(f"\n{'═'*60}\n  Evaluating trên {len(eval_files)} files\n{'═'*60}")
     err, positions = evaluate_files(
