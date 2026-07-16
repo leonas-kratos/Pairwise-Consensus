@@ -547,7 +547,7 @@ def main():
     perm        = np.random.permutation(n)
     shuffled    = [all_files[i] for i in perm]
     n_train     = min(0, n)
-    n_val       = min(6, max(0, n - n_train))
+    n_val       = min(0, max(0, n - n_train))
     train_files = shuffled[:n_train]
     val_files   = shuffled[n_train:n_train + n_val]
     test_files  = shuffled[n_train + n_val:]

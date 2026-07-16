@@ -2,19 +2,12 @@
 """
 UWB Indoor Positioning — V18: Robust & Adaptive KF
 ===================================================
-THAY ĐỔI SO VỚI V17:
-  - Grid search cho tất cả (bao gồm PC-UKF-2D)
-  - AEKF: cải thiện R adaptation với upper bound để tránh diverge/unstable
-  - VBAKF: minor fix stabilization
-  - PC-UKF-2D: giờ có grid search tuning
-
 CÁC PHƯƠNG PHÁP:
   1. Raw + WLS        — baseline
-  2. Huber-UKF        — IRLS Huber M-estimator
-  3. MCC-UKF          — Maximum Correntropy Criterion UKF
-  4. AEKF (IAE)       — Innovation Adaptive Estimation (chỉ adapt R)
-  5. VBAKF            — Variational Bayesian Adaptive KF
-  6. PC-UKF-2D        — Pairwise Consensus adaptive R + UKF 2D (tuned)
+  2. UKF              — Unscented Kalman Filter chuẩn
+  3. Huber-UKF        — IRLS Huber M-estimator
+  4. MCC-UKF          — Maximum Correntropy Criterion UKF
+  5. PC-UKF-2D        — Pairwise Consensus adaptive R + UKF 2D (tuned)
 
 Format file .txt: timestamp, d0_slant, d1_slant, d2_slant, d3_slant, v_mm_s, gz_dps
 """
@@ -59,50 +52,39 @@ SPEED      = 200.0
 GT_SPACING = 5.0
 N_ANCHORS  = 4
 
+# ─── Standard UKF ────────────────────────────────────────────────────
+UKF_STD_Q      = 0.001
+UKF_STD_R      = 50.0
+
 # ─── Huber-UKF ───────────────────────────────────────────────────────
-HUBER_Q       = 0.01
-HUBER_R       = 300.0
+HUBER_Q       = 0.001
+HUBER_R       = 10.0
 HUBER_DELTA   = 2.0
 HUBER_MAXITER = 10
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
-MCC_Q          = 0.01
-MCC_R          = 300.0
+MCC_Q          = 0.001
+MCC_R          = 100.0
 MCC_KERNEL_BW  = 1700.0
 MCC_MAXITER    = 5
 
-# ─── AEKF (chỉ adapt R, Q cố định để tránh diverge) ─────────────────
-AEKF_Q0        = 0.01
-AEKF_R0        = 500.0
-AEKF_WIN       = 20
-AEKF_ALPHA_R   = 0.7
-AEKF_R_MIN     = 5.0
-
-# ─── VBAKF ────────────────────────────────────────────────────────────
-VBAKF_Q0       = 0.01
-VBAKF_R0       = 100.0
-VBAKF_RHO      = 0.99
-VBAKF_MAXITER  = 5
-
 # ─── PC-UKF-2D ─────────────────
-PCUKF_Q        = 0.01
-PCUKF_R_BASE   = 300.0
+PCUKF_Q        = 0.001
+PCUKF_R_BASE   = 50.0
 PCUKF_R_SCALE  = 5.0
-PCUKF_SIGMA    = 50.0
+PCUKF_SIGMA    = 200.0
 
 # ─── UKF common ──────────────────────────────────────────────────────
 UKF_ALPHA = 1e-3
 UKF_BETA  = 2.0
 UKF_KAPPA = 0.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-# Tổng path length thực tế (mm) — dùng để kiểm tra trajectory collapse
-# Nếu tổng displacement < MOTION_RATIO_MIN * expected_path_length → collapsed
-MOTION_RATIO_MIN = 0.15   # trajectory phải di chuyển ít nhất 15% quãng đường thực
+MOTION_RATIO_MIN = 0.15
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -166,19 +148,11 @@ def compute_trajectory_displacement(pos_xy):
 
 def is_trajectory_collapsed(pos_xy, expected_path_length,
                              ratio_min=MOTION_RATIO_MIN):
-    """
-    Trả về True nếu trajectory bị 'đứng yên' (collapsed).
-
-    Tiêu chí:
-      - Tổng displacement < ratio_min * expected_path_length
-      - HOẶC bounding box (max - min) trên cả 2 trục đều < 5% path length
-    """
     if len(pos_xy) < 2:
         return True
     total_disp = compute_trajectory_displacement(pos_xy)
     if total_disp < ratio_min * expected_path_length:
         return True
-    # Kiểm tra bounding box — nếu model "nhảy quanh 1 điểm"
     bbox_x = pos_xy[:, 0].max() - pos_xy[:, 0].min()
     bbox_y = pos_xy[:, 1].max() - pos_xy[:, 1].min()
     bbox_diag = math.sqrt(bbox_x**2 + bbox_y**2)
@@ -250,7 +224,47 @@ def default_init(dist_raw_0):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  1. HUBER-UKF
+#  1. STANDARD UKF
+# ══════════════════════════════════════════════════════════════════════
+class StandardUKF:
+    def __init__(self, q=UKF_STD_Q, r=UKF_STD_R):
+        self.n     = 2
+        self.Q_mat = np.eye(2) * q
+        self.R_mat = np.eye(N_ANCHORS) * r
+        self.Wm, self.Wc, self.c = ukf_weights(self.n)
+        self.x = None
+        self.P = None
+
+    def init(self, x0):
+        self.x = x0.astype(float).copy()
+        self.P = np.eye(self.n) * 1e6
+
+    def step(self, z_raw):
+        if self.x is None:
+            return np.full(2, np.nan)
+        x_pred = self.x.copy()
+        P_pred = self.P + self.Q_mat
+
+        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
+            x_pred, P_pred, self.Wm, self.Wc, self.c)
+
+        Pzz_eff = Pzz_no_R + self.R_mat
+        innov   = z_raw - z_hat
+
+        try:
+            K = Pxz @ np.linalg.inv(Pzz_eff)
+        except np.linalg.LinAlgError:
+            self.x = x_pred
+            self.P = make_spd(P_pred)
+            return self.x.copy()
+
+        self.x = x_pred + K @ innov
+        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        return self.x.copy()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  3. HUBER-UKF
 # ══════════════════════════════════════════════════════════════════════
 class HuberUKF:
     def __init__(self, q=HUBER_Q, r=HUBER_R,
@@ -312,7 +326,7 @@ class HuberUKF:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  2. MCC-UKF
+#  4. MCC-UKF
 # ══════════════════════════════════════════════════════════════════════
 class MCCUKF:
     def __init__(self, q=MCC_Q, r=MCC_R,
@@ -368,133 +382,6 @@ class MCCUKF:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  3. AEKF
-# ══════════════════════════════════════════════════════════════════════
-class AEKF:
-    def __init__(self, q0=AEKF_Q0, r0=AEKF_R0,
-                 win=AEKF_WIN, alpha_r=AEKF_ALPHA_R, r_min=AEKF_R_MIN):
-        self.n       = 2
-        self.alpha_r = alpha_r
-        self.r_min   = r_min
-        self.win     = win
-        self.Q       = np.eye(2) * q0
-        self.R       = np.eye(N_ANCHORS) * r0
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
-        self.x = None
-        self.P = None
-        self._innov_buf = []
-
-    def init(self, x0):
-        self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
-        self._innov_buf = []
-
-    def _update_R(self, innov, Pzz_no_R):
-        self._innov_buf.append(innov.copy())
-        if len(self._innov_buf) > self.win:
-            self._innov_buf.pop(0)
-        N   = len(self._innov_buf)
-        buf = np.array(self._innov_buf)
-        C_innov = (buf.T @ buf) / N
-        R_hat = C_innov - Pzz_no_R
-        r_diag = np.maximum(np.diag(R_hat), self.r_min)
-        r_diag = np.minimum(r_diag, 10000.0)
-        R_hat  = np.diag(r_diag)
-        self.R = self.alpha_r * self.R + (1 - self.alpha_r) * R_hat
-        self.R = make_spd(self.R, eps=self.r_min)
-
-    def step(self, z_raw):
-        if self.x is None:
-            return np.full(2, np.nan)
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q
-
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-
-        Pzz_eff = Pzz_no_R + self.R
-        innov   = z_raw - z_hat
-
-        try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
-        except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
-            return self.x.copy()
-
-        self._update_R(innov, Pzz_no_R)
-
-        self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
-        return self.x.copy()
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  4. VBAKF
-# ══════════════════════════════════════════════════════════════════════
-class VBAKF:
-    def __init__(self, q0=VBAKF_Q0, r0=VBAKF_R0,
-                 rho=VBAKF_RHO, maxiter=VBAKF_MAXITER):
-        self.n       = 2
-        self.Q       = np.eye(2) * q0
-        self.rho     = rho
-        self.maxiter = maxiter
-        M            = N_ANCHORS
-        self.nu      = float(M + 2)
-        self.Psi     = np.eye(M) * r0 * 1.0
-        self.nu_hat  = self.nu
-        self.Psi_hat = self.Psi.copy()
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
-        self.x = None
-        self.P = None
-
-    def init(self, x0):
-        self.x       = x0.astype(float).copy()
-        self.P       = np.eye(self.n) * 1e6
-        self.nu_hat  = self.nu
-        self.Psi_hat = self.Psi.copy()
-
-    def step(self, z_raw):
-        if self.x is None:
-            return np.full(2, np.nan)
-        M = N_ANCHORS
-
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q
-
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-
-        nu_k  = self.rho * self.nu_hat + (1 - self.rho) * (M + 2.0)
-        Psi_k = self.rho * self.Psi_hat
-
-        nu_iter  = nu_k
-        Psi_iter = Psi_k.copy()
-        innov    = z_raw - z_hat
-        x_cur    = x_pred.copy()
-        K        = np.zeros((self.n, M))
-
-        for _ in range(self.maxiter):
-            dof   = max(nu_iter - M - 1.0, 0.5)
-            R_cur = make_spd(Psi_iter / dof, eps=1.0)
-            Pzz_eff = Pzz_no_R + R_cur
-            try:
-                K = Pxz @ np.linalg.inv(Pzz_eff)
-            except np.linalg.LinAlgError:
-                break
-            x_cur    = x_pred + K @ innov
-            post_innov = innov
-            Psi_iter = Psi_k + np.outer(post_innov, post_innov) + Pzz_no_R
-            nu_iter  = nu_k + 1.0
-
-        self.Psi_hat = Psi_iter
-        self.nu_hat  = max(nu_iter, M + 2.0)
-        self.x = x_cur
-        self.P = make_spd(P_pred - K @ (Pzz_no_R + make_spd(Psi_iter / max(nu_iter - M - 1.0, 0.5), eps=1.0)) @ K.T)
-        return self.x.copy()
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  5. PC-UKF-2D
 # ══════════════════════════════════════════════════════════════════════
 class _KF1D_for_PC:
@@ -514,19 +401,30 @@ class _KF1D_for_PC:
         return innov
 
 
-def _pc_consensus_scores(innovations, sigma=PCUKF_SIGMA):
-    innov  = np.abs(innovations)
+def pc_consensus_scores(innovations, sigma=PCUKF_SIGMA, d_raw=None):
+    if d_raw is not None:
+        pos_est = wls_position(d_raw)
+        if not np.any(np.isnan(pos_est)):
+            residual = np.zeros(N_ANCHORS)
+            for i, (ax, ay) in enumerate(ANCHORS):
+                d_est = math.sqrt((pos_est[0]-ax)**2 + (pos_est[1]-ay)**2)
+                residual[i] = abs(d_raw[i] - d_est)
+        else:
+            residual = np.abs(innovations)
+    else:
+        residual = np.abs(innovations)
+
     scores = np.zeros(N_ANCHORS)
-    nu     = 4.0
+    eps = 1e-9
     for i in range(N_ANCHORS):
-        s = 0.0
+        s = 0.0; cnt = 0
         for j in range(N_ANCHORS):
-            if i == j:
-                continue
-            diff = innov[i] - innov[j]
-            c    = (1.0 + diff**2 / (nu * sigma**2 + 1e-9)) ** (-(nu + 1.0) / 2.0)
-            s   += c
-        scores[i] = s / (N_ANCHORS - 1)
+            if i == j: continue
+            diff = residual[i] - residual[j]
+            nu = 4.0
+            c = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu+1.0)/2.0)
+            s += c; cnt += 1
+        scores[i] = s / cnt
     return scores
 
 
@@ -552,7 +450,7 @@ class PCUKF2D:
             return np.full(2, np.nan)
 
         innovations = np.array([self._kfs[i].update(z_raw[i]) for i in range(N_ANCHORS)])
-        scores      = _pc_consensus_scores(innovations, self.sigma)
+        scores = pc_consensus_scores(innovations, self.sigma, d_raw=z_raw)
         R_diag      = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
 
         x_pred = self.x.copy()
@@ -625,21 +523,18 @@ def safe_len(path):
 # ══════════════════════════════════════════════════════════════════════
 METHODS = {
     "Raw+WLS"   : None,
-    "Huber-UKF" : (HuberUKF,  dict(q=HUBER_Q,    r=HUBER_R,    delta=HUBER_DELTA)),
-    "MCC-UKF"   : (MCCUKF,    dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
-    "AEKF-IAE"  : (AEKF,      dict(q0=AEKF_Q0,    r0=AEKF_R0,   win=AEKF_WIN,
-                                    alpha_r=AEKF_ALPHA_R)),
-    "VBAKF"     : (VBAKF,     dict(q0=VBAKF_Q0,   r0=VBAKF_R0,  rho=VBAKF_RHO)),
-    "PC-UKF-2D" : (PCUKF2D,   dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
-                                    r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)),
+    "UKF"       : (StandardUKF, dict(q=UKF_STD_Q,  r=UKF_STD_R)),
+    "Huber-UKF" : (HuberUKF,   dict(q=HUBER_Q,     r=HUBER_R,    delta=HUBER_DELTA)),
+    "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
+    "PC-UKF-2D" : (PCUKF2D,    dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
+                                     r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)),
 }
 
 COLORS = {
     "Raw+WLS"   : '#9E9E9E',
+    "UKF"       : '#00BCD4',
     "Huber-UKF" : '#E91E63',
     "MCC-UKF"   : '#FF9800',
-    "AEKF-IAE"  : '#2196F3',
-    "VBAKF"     : '#4CAF50',
     "PC-UKF-2D" : '#9C27B0',
 }
 
@@ -650,17 +545,17 @@ COLORS = {
 def evaluate_files(file_paths, gt_xy, expected_path_length):
     all_errors    = {m: [] for m in METHODS}
     all_pos       = {m: [] for m in METHODS}
-    collapse_warn = {m: [] for m in METHODS}   # list file bị collapse
+    collapse_warn = {m: [] for m in METHODS}
     timing        = {m: [] for m in METHODS if m != "Raw+WLS"}
 
     hdr = f"{'File':<18s}"
     for m in METHODS:
         hdr += f" {m:>12s}"
-    print("\n" + "═" * 100)
+    print("\n" + "═" * 80)
     print("  PER-FILE RMSE (mm)   [⚠ = trajectory collapsed / static]")
-    print("═" * 100)
+    print("═" * 80)
     print(hdr)
-    print("─" * 100)
+    print("─" * 80)
 
     for path in file_paths:
         dist_raw = parse_file(path)
@@ -680,7 +575,6 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
             valid = pos[~np.any(np.isnan(pos), axis=1)]
 
-            # ── Motion sanity check ──────────────────────────────────
             collapsed = is_trajectory_collapsed(valid, expected_path_length)
             if collapsed:
                 collapse_warn[name].append(os.path.basename(path))
@@ -694,9 +588,8 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
         print(row)
 
-    print("─" * 100)
+    print("─" * 80)
 
-    # Timing summary
     print("\n  TIMING (ms/sample):")
     for name, times in timing.items():
         if not times:
@@ -706,7 +599,6 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
         if n_samp > 0:
             print(f"    {name:<14s}: {total_t * 1000 / n_samp:.4f} ms/sample")
 
-    # Collapse summary
     print("\n  COLLAPSE WARNINGS (trajectory đứng yên):")
     any_warn = False
     for name, files in collapse_warn.items():
@@ -725,12 +617,6 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
 
 def compute_metrics(errors, pos_xy=None, expected_path_length=None):
-    """
-    Tính các metrics.
-    Nếu pos_xy và expected_path_length được cung cấp, thêm:
-      - motion_ratio : displacement / expected_path_length
-      - collapsed    : bool
-    """
     base = {}
     if len(errors) == 0:
         base = {k: float('nan') for k in
@@ -762,15 +648,11 @@ def compute_metrics(errors, pos_xy=None, expected_path_length=None):
 # ══════════════════════════════════════════════════════════════════════
 #  GRID SEARCH — với motion penalty
 # ══════════════════════════════════════════════════════════════════════
-COLLAPSE_PENALTY = 1e9   # RMSE penalty nếu trajectory collapse
+COLLAPSE_PENALTY = 1e9
+
 
 def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
                       expected_path_length):
-    """
-    Chạy filter trên tất cả file, trả về RMSE tổng.
-    Nếu bất kỳ file nào bị trajectory collapse → trả về penalty lớn
-    để loại bỏ params đó khỏi grid search.
-    """
     pos_all      = []
     n_collapsed  = 0
     n_files      = 0
@@ -791,73 +673,24 @@ def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
     if n_files == 0:
         return float('inf')
 
-    # Nếu quá nhiều file bị collapse (>30%) → reject params này
     collapse_rate = n_collapsed / n_files
     if collapse_rate > 0.30:
-        return COLLAPSE_PENALTY + collapse_rate  # giá trị rất lớn
+        return COLLAPSE_PENALTY + collapse_rate
 
     if not pos_all:
         return float('inf')
 
     errs = nearest_gt_error(np.array(pos_all), gt_xy)
     rmse = float(np.sqrt(np.mean(errs**2)))
-
-    # Penalty nhẹ cho từng file bị collapse còn lại (< 30%)
     rmse += n_collapsed * 500.0
 
     return rmse
 
 
-def grid_search_aekf(file_paths, gt_xy, expected_path_length):
-    grid = {
-        'r0'     : [100.0, 300.0],
-        'win'    : [20, 50, 100],
-        'alpha_r': [0.90, 0.95, 0.98, 0.99],
-    }
-    keys   = list(grid.keys())
-    combos = list(itertools.product(*[grid[k] for k in keys]))
-    print(f"\n  Grid search AEKF: {len(combos)} combinations...")
-    best_rmse = float('inf')
-    best = dict(q0=AEKF_Q0, r0=AEKF_R0, win=AEKF_WIN, alpha_r=AEKF_ALPHA_R)
-    for combo in combos:
-        params = dict(zip(keys, combo))
-        params['q0']    = AEKF_Q0
-        params['r_min'] = AEKF_R_MIN
-        rmse = _eval_rmse_single(AEKF, params, file_paths, gt_xy, expected_path_length)
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best = params.copy()
-    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
-    print(f"  Best AEKF: RMSE={best_rmse:.1f}mm{tag} | r0={best['r0']} win={best['win']} alpha_r={best['alpha_r']}")
-    return best
-
-
-def grid_search_vbakf(file_paths, gt_xy, expected_path_length):
-    grid = {
-        'r0' : [100.0, 300.0],
-        'rho': [0.95, 0.97, 0.98, 0.99],
-    }
-    keys   = list(grid.keys())
-    combos = list(itertools.product(*[grid[k] for k in keys]))
-    print(f"\n  Grid search VBAKF: {len(combos)} combinations...")
-    best_rmse = float('inf')
-    best = dict(q0=VBAKF_Q0, r0=VBAKF_R0, rho=VBAKF_RHO)
-    for combo in combos:
-        params = dict(zip(keys, combo))
-        params['q0'] = VBAKF_Q0
-        rmse = _eval_rmse_single(VBAKF, params, file_paths, gt_xy, expected_path_length)
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best = params.copy()
-    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
-    print(f"  Best VBAKF: RMSE={best_rmse:.1f}mm{tag} | r0={best['r0']} rho={best['rho']}")
-    return best
-
-
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'    : [300.0],
-        'delta': [0.5, 1.0, 1.345, 2.0],
+        'r'    : [1.0, 10.0, 50.0, 100.0, 200.0],
+        'delta': [0.5, 1.0, 1.345, 1.5, 2.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -878,8 +711,8 @@ def grid_search_huber(file_paths, gt_xy, expected_path_length):
 
 def grid_search_mcc(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'        : [300.0],
-        'kernel_bw': [1700.0],
+        'r'        : [10.0, 50.0, 100.0, 200.0],
+        'kernel_bw': [100.0, 200.0, 500.0, 1000.0, 1700.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -957,7 +790,9 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
 def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     labels = list(METHODS.keys())
     n      = len(labels)
-    fig, axes = plt.subplots(2, 3, figsize=(21, 14))
+    ncols  = 3
+    nrows  = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(21, 7 * nrows))
     axes = axes.flatten()
     for ax, label in zip(axes, labels):
         pos   = positions_dict.get(label, np.empty((0, 2)))
@@ -1036,11 +871,10 @@ def main():
     print("  V18: Robust & Adaptive UKF — UWB Indoor Positioning")
     print("=" * 70)
     print("  1. Raw+WLS      — Weighted Least Squares (baseline)")
-    print("  2. Huber-UKF    — IRLS với Huber M-estimator")
-    print("  3. MCC-UKF      — Maximum Correntropy Criterion UKF")
-    print("  4. AEKF-IAE     — Sage-Husa adaptive R (Q cố định)")
-    print("  5. VBAKF        — Variational Bayesian Adaptive KF")
-    print("  6. PC-UKF-2D    — Pairwise Consensus UKF (đã tuning V15)")
+    print("  2. UKF          — Unscented Kalman Filter chuẩn")
+    print("  3. Huber-UKF    — IRLS với Huber M-estimator")
+    print("  4. MCC-UKF      — Maximum Correntropy Criterion UKF")
+    print("  5. PC-UKF-2D    — Pairwise Consensus UKF (đã tuning V15)")
     print("=" * 70)
     print(f"\n  Motion collapse detection: ratio_min={MOTION_RATIO_MIN:.0%}")
 
@@ -1067,15 +901,11 @@ def main():
 
         best_huber = grid_search_huber(eval_files, gt_xy, expected_path_length)
         best_mcc   = grid_search_mcc(eval_files, gt_xy, expected_path_length)
-        best_aekf  = grid_search_aekf(eval_files, gt_xy, expected_path_length)
-        best_vbakf = grid_search_vbakf(eval_files, gt_xy, expected_path_length)
         best_pc    = grid_search_pcukf(eval_files, gt_xy, expected_path_length)
 
-        METHODS["Huber-UKF"] = (HuberUKF, best_huber)
-        METHODS["MCC-UKF"]   = (MCCUKF,   best_mcc)
-        METHODS["AEKF-IAE"]  = (AEKF,     best_aekf)
-        METHODS["VBAKF"]     = (VBAKF,    best_vbakf)
-        METHODS["PC-UKF-2D"] = (PCUKF2D,  best_pc)
+        METHODS["Huber-UKF"] = (HuberUKF,    best_huber)
+        METHODS["MCC-UKF"]   = (MCCUKF,      best_mcc)
+        METHODS["PC-UKF-2D"] = (PCUKF2D,     best_pc)
 
     # ── Evaluate ──────────────────────────────────────────────────────
     errors, positions, collapse_warn = evaluate_files(
@@ -1083,12 +913,12 @@ def main():
 
     # ── Summary table ─────────────────────────────────────────────────
     metrics = {}
-    print(f"\n{'═' * 95}")
+    print(f"\n{'═' * 85}")
     print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed (motion_ratio < {MOTION_RATIO_MIN:.0%})")
-    print(f"{'═' * 95}")
+    print(f"{'═' * 85}")
     print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
           f"{'P95':>7s} {'MAX':>7s} {'MotionR':>8s} {'Status'}")
-    print(f"  {'─' * 82}")
+    print(f"  {'─' * 73}")
 
     for label, errs in errors.items():
         if len(errs) == 0:
