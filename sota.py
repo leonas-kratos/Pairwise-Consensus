@@ -79,12 +79,12 @@ UKF_ALPHA = 1e-3
 UKF_BETA  = 2.0
 UKF_KAPPA = 0.0
 
-DO_GRID_SEARCH = True
+DO_GRID_SEARCH = False
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 0.15
+MOTION_RATIO_MIN = 0.50
 
 
 # ══════════════════════════════════════════════════════════════════════

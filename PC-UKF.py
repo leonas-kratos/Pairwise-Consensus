@@ -67,8 +67,8 @@ UKF2D_KAPPA = 0.0    # UKF secondary scaling
 
 # PC-UKF-2D params
 PCUKF2D_Q       = 0.001
-PCUKF2D_R_BASE  = 50.0
-PCUKF2D_R_SCALE = 5.0
+PCUKF2D_R_BASE  = 40.0
+PCUKF2D_R_SCALE = 10.0
 PCUKF2D_SIGMA   = 200.0
 
 # PC-LS params (no filter state, just weighted WLS per timestep)
