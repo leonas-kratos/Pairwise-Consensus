@@ -67,9 +67,9 @@ UKF2D_KAPPA = 0.0    # UKF secondary scaling
 
 # PC-UKF-2D params
 PCUKF2D_Q       = 0.001
-PCUKF2D_R_BASE  = 10.0
-PCUKF2D_R_SCALE = 20.0
-PCUKF2D_SIGMA   = 10.0
+PCUKF2D_R_BASE  = 50.0
+PCUKF2D_R_SCALE = 5.0
+PCUKF2D_SIGMA   = 300.0
 
 # PC-LS params (no filter state, just weighted WLS per timestep)
 PCLS_R_BASE  = 200.0
@@ -80,7 +80,7 @@ PCLS_SIGMA   = 200.0
 PC_KF_Q = 0.01
 PC_KF_R = 200.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_vPCUKF"
 
@@ -585,10 +585,10 @@ def compute_metrics(errors, label=""):
 # ══════════════════════════════════════════════════════════════════════
 def grid_search(val_files, gt_xy):
     grid = {
-        'q'      : [0.001, 0.01, 0.1],
-        'r_base' : [1.0, 10.0, 25.0, 50.0, 100.0, 200.0, 300.0],
-        'r_scale': [5.0, 10.0, 15.0, 20.0],
-        'sigma'  : [10.0, 50.0, 100.0, 150.0, 200.0],
+        'q'      : [0.001],
+        'r_base' : [25.0, 50.0, 100.0, 200.0, 300.0],
+        'r_scale': [5.0, 10.0, 15.0, 20.0, 30.0],
+        'sigma'  : [10.0, 50.0, 100.0, 150.0, 200.0, 300.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))

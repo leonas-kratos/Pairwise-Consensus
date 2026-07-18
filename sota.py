@@ -59,8 +59,8 @@ UKF_STD_R      = 50.0
 # ─── Huber-UKF ───────────────────────────────────────────────────────
 HUBER_Q       = 0.001
 HUBER_R       = 10.0
-HUBER_DELTA   = 2.0
-HUBER_MAXITER = 10
+HUBER_DELTA   = 2.5
+HUBER_MAXITER = 5
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
 MCC_Q          = 0.001
@@ -72,14 +72,14 @@ MCC_MAXITER    = 5
 PCUKF_Q        = 0.001
 PCUKF_R_BASE   = 50.0
 PCUKF_R_SCALE  = 5.0
-PCUKF_SIGMA    = 200.0
+PCUKF_SIGMA    = 300.0
 
 # ─── UKF common ──────────────────────────────────────────────────────
 UKF_ALPHA = 1e-3
 UKF_BETA  = 2.0
 UKF_KAPPA = 0.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
@@ -689,8 +689,8 @@ def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
 
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'    : [1.0, 10.0, 50.0, 100.0, 200.0],
-        'delta': [0.5, 1.0, 1.345, 1.5, 2.0],
+        'r'    : [1.0, 5.0, 10.0, 20.0, 30.0, 40.0],
+        'delta': [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -733,9 +733,9 @@ def grid_search_mcc(file_paths, gt_xy, expected_path_length):
 
 def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r_base' : [100.0, 200.0, 300.0],
+        'r_base' : [50.0, 100.0, 200.0],
         'r_scale': [1.0, 3.0, 5.0, 8.0, 10.0, 20.0, 50.0],
-        'sigma'  : [20.0, 30.0, 50.0, 100.0],
+        'sigma'  : [20.0, 30.0, 50.0, 100.0, 200.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
