@@ -3,7 +3,7 @@
 UWB Indoor Positioning — V18: Robust & Adaptive KF
 ===================================================
 CÁC PHƯƠNG PHÁP:
-  1. Raw + WLS        — baseline
+  1. Raw + LS        — baseline
   2. UKF              — Unscented Kalman Filter chuẩn
   3. Huber-UKF        — IRLS Huber M-estimator
   4. MCC-UKF          — Maximum Correntropy Criterion UKF
@@ -57,8 +57,13 @@ UKF_STD_Q      = 0.001
 UKF_STD_R      = 50.0
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
+# HUBER_Q       = 0.001
+# HUBER_R       = 40.0
+# HUBER_DELTA   = 20.0
+# HUBER_MAXITER = 5
+
 HUBER_Q       = 0.001
-HUBER_R       = 10.0
+HUBER_R       = 20.0
 HUBER_DELTA   = 2.5
 HUBER_MAXITER = 5
 
@@ -69,22 +74,27 @@ MCC_KERNEL_BW  = 1700.0
 MCC_MAXITER    = 5
 
 # ─── PC-UKF-2D ─────────────────
+# PCUKF_Q        = 0.001
+# PCUKF_R_BASE   = 50.0
+# PCUKF_R_SCALE  = 5.0
+# PCUKF_SIGMA    = 300.0
+
 PCUKF_Q        = 0.001
-PCUKF_R_BASE   = 50.0
-PCUKF_R_SCALE  = 5.0
-PCUKF_SIGMA    = 300.0
+PCUKF_R_BASE   = 100.0
+PCUKF_R_SCALE  = 1.0
+PCUKF_SIGMA    = 20.0
 
 # ─── UKF common ──────────────────────────────────────────────────────
 UKF_ALPHA = 1e-3
 UKF_BETA  = 2.0
 UKF_KAPPA = 0.0
 
-DO_GRID_SEARCH = True
+DO_GRID_SEARCH = False
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 0.50
+MOTION_RATIO_MIN = 0.80
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -115,7 +125,7 @@ def nearest_gt_error(pos_xy, gt_xy):
     return errors
 
 
-def wls_position(distances, anchors=ANCHORS, weights=None):
+def LS_position(distances, anchors=ANCHORS, weights=None):
     x0, y0 = anchors[0]
     d0     = max(distances[0], 1.0)
     rows, b, w = [], [], []
@@ -219,7 +229,7 @@ def make_spd(P, eps=1e-9):
 
 
 def default_init(dist_raw_0):
-    pos = wls_position(dist_raw_0)
+    pos = LS_position(dist_raw_0)
     return pos if not np.any(np.isnan(pos)) else np.array([2000.0, 4400.0])
 
 
@@ -288,35 +298,32 @@ class HuberUKF:
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
 
+        # Compute một lần từ x_pred
         z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
             x_pred, P_pred, self.Wm, self.Wc, self.c)
 
-        R_eff  = np.eye(N_ANCHORS) * self.R_base
-        x_cur  = x_pred.copy()
+        R_eff = np.eye(N_ANCHORS) * self.R_base
+        K     = np.zeros((self.n, N_ANCHORS))
+
         for _ in range(self.maxiter):
             Pzz_eff  = Pzz_no_R + R_eff
-            innov    = z_raw - z_hat
+            innov    = z_raw - z_hat          # z_hat cố định từ x_pred — đúng cho IRLS
             pzz_diag = np.maximum(np.diag(Pzz_eff), 1e-9)
             r_scaled = innov / np.sqrt(pzz_diag)
-            hub_w    = np.where(np.abs(r_scaled) <= self.delta,
-                                1.0, self.delta / (np.abs(r_scaled) + 1e-9))
-            hub_w    = np.maximum(hub_w, 1e-4)
-            R_eff    = np.diag(self.R_base / hub_w)
-            Pzz_eff  = Pzz_no_R + R_eff
-            try:
-                K = Pxz @ np.linalg.inv(Pzz_eff)
-            except np.linalg.LinAlgError:
-                break
-            x_new = x_pred + K @ innov
-            if np.linalg.norm(x_new - x_cur) < 1e-3:
-                x_cur = x_new
-                break
-            x_cur = x_new
+            hub_w    = np.where(
+                np.abs(r_scaled) <= self.delta,
+                1.0,
+                self.delta / (np.abs(r_scaled) + 1e-9)
+            )
+            hub_w = np.maximum(hub_w, 1e-4)
+            R_eff = np.diag(self.R_base / hub_w)
 
+        # Một lần update cuối với R_eff đã hội tụ
+        Pzz_eff = Pzz_no_R + R_eff
         try:
             K = Pxz @ np.linalg.inv(Pzz_eff)
         except np.linalg.LinAlgError:
-            self.x = x_cur
+            self.x = x_pred
             self.P = make_spd(P_pred)
             return self.x.copy()
 
@@ -403,7 +410,7 @@ class _KF1D_for_PC:
 
 def pc_consensus_scores(innovations, sigma=PCUKF_SIGMA, d_raw=None):
     if d_raw is not None:
-        pos_est = wls_position(d_raw)
+        pos_est = LS_position(d_raw)
         if not np.any(np.isnan(pos_est)):
             residual = np.zeros(N_ANCHORS)
             for i, (ax, ay) in enumerate(ANCHORS):
@@ -522,7 +529,7 @@ def safe_len(path):
 #  METHODS TABLE
 # ══════════════════════════════════════════════════════════════════════
 METHODS = {
-    "Raw+WLS"   : None,
+    "Raw+LS"   : None,
     "UKF"       : (StandardUKF, dict(q=UKF_STD_Q,  r=UKF_STD_R)),
     "Huber-UKF" : (HuberUKF,   dict(q=HUBER_Q,     r=HUBER_R,    delta=HUBER_DELTA)),
     "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
@@ -531,7 +538,7 @@ METHODS = {
 }
 
 COLORS = {
-    "Raw+WLS"   : '#9E9E9E',
+    "Raw+LS"   : '#9E9E9E',
     "UKF"       : '#00BCD4',
     "Huber-UKF" : '#E91E63',
     "MCC-UKF"   : '#FF9800',
@@ -546,7 +553,7 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
     all_errors    = {m: [] for m in METHODS}
     all_pos       = {m: [] for m in METHODS}
     collapse_warn = {m: [] for m in METHODS}
-    timing        = {m: [] for m in METHODS if m != "Raw+WLS"}
+    timing        = {m: [] for m in METHODS if m != "Raw+LS"}
 
     hdr = f"{'File':<18s}"
     for m in METHODS:
@@ -566,7 +573,7 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
         for name, method in METHODS.items():
             if method is None:
-                pos = np.array([wls_position(dist_raw[t]) for t in range(T)])
+                pos = np.array([LS_position(dist_raw[t]) for t in range(T)])
             else:
                 filt_cls, kwargs = method
                 t0  = time.perf_counter()
@@ -689,8 +696,8 @@ def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
 
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'    : [1.0, 5.0, 10.0, 20.0, 30.0, 40.0],
-        'delta': [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+        'r'    : [1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
+        'delta': [1.0, 1.5, 2.0, 2.5, 5.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -712,7 +719,7 @@ def grid_search_huber(file_paths, gt_xy, expected_path_length):
 def grid_search_mcc(file_paths, gt_xy, expected_path_length):
     grid = {
         'r'        : [10.0, 50.0, 100.0, 200.0],
-        'kernel_bw': [100.0, 200.0, 500.0, 1000.0, 1700.0],
+        'kernel_bw': [1100.0, 1200.0, 1300.0, 1700.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -734,7 +741,7 @@ def grid_search_mcc(file_paths, gt_xy, expected_path_length):
 def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
     grid = {
         'r_base' : [50.0, 100.0, 200.0],
-        'r_scale': [1.0, 3.0, 5.0, 8.0, 10.0, 20.0, 50.0],
+        'r_scale': [1.0, 3.0, 5.0, 10.0, 20.0],
         'sigma'  : [20.0, 30.0, 50.0, 100.0, 200.0],
     }
     keys   = list(grid.keys())
@@ -766,8 +773,8 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
         cdf  = np.arange(1, len(s) + 1) / len(s)
         rmse = np.sqrt(np.mean(errors**2))
         c    = COLORS.get(label, 'gray')
-        lw   = 2.5 if label not in ("Raw+WLS",) else 1.5
-        ls   = '-'  if label not in ("Raw+WLS",) else '--'
+        lw   = 2.5 if label not in ("Raw+LS",) else 1.5
+        ls   = '-'  if label not in ("Raw+LS",) else '--'
         n_col = len(collapse_warn.get(label, []))
         warn_tag = f" ⚠{n_col}" if n_col > 0 else ""
         ax.plot(s, cdf, lw=lw, color=c, ls=ls,
@@ -776,11 +783,10 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
     ax.set_xlabel("Position Error (mm)", fontsize=13, fontweight='bold')
     ax.set_ylabel("CDF", fontsize=13, fontweight='bold')
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
-    ax.set_xlim(0, 2000)
+    ax.set_xlim(0, 500)
     ax.set_ylim(0, 1.02)
     ax.legend(fontsize=10, loc='lower right')
     ax.grid(True, ls='--', alpha=0.4)
-    ax.set_title("V18 — CDF Position Error  (⚠ = collapsed file count)", fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     print(f"[✓] CDF → {save_path}")
@@ -788,43 +794,40 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
 
 
 def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
-    labels = list(METHODS.keys())
-    n      = len(labels)
-    ncols  = 3
-    nrows  = math.ceil(n / ncols)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(21, 7 * nrows))
-    axes = axes.flatten()
-    for ax, label in zip(axes, labels):
-        pos   = positions_dict.get(label, np.empty((0, 2)))
+    fig, ax = plt.subplots(figsize=(12, 14))
+
+    ax.plot(gt_xy[:, 0], gt_xy[:, 1], 'k--', lw=2.5, label='Ground Truth', alpha=0.5, zorder=5)
+
+    for label, pos in positions_dict.items():
         color = COLORS.get(label, 'gray')
-        ax.plot(gt_xy[:, 0], gt_xy[:, 1], 'k--', lw=2, label='GT', alpha=0.4)
-        if len(pos) > 0:
-            ax.plot(pos[:, 0], pos[:, 1], color=color, lw=0.8, alpha=0.75, label=label)
-        for nm, pt in zip(["A", "B", "C", "D"], WAYPOINTS[:4]):
-            ax.scatter(*pt, s=70, color='black', zorder=10)
-            ax.annotate(nm, pt, textcoords="offset points",
-                        xytext=(6, 4), fontsize=12, fontweight='bold')
-        for j, (ax_, ay_) in enumerate(ANCHORS):
-            ax.scatter(ax_, ay_, s=90, marker='s', color='red', zorder=10)
-            ax.annotate(f"A{j+1}", (ax_, ay_), textcoords="offset points",
-                        xytext=(5, 5), fontsize=9, color='red')
+        if len(pos) == 0:
+            continue
+        errs = nearest_gt_error(pos, gt_xy)
+        rmse = np.sqrt(np.mean(errs**2))
         n_col = len(collapse_warn.get(label, []))
-        if len(pos) > 0:
-            errs = nearest_gt_error(pos, gt_xy)
-            rmse = np.sqrt(np.mean(errs**2))
-            warn = f"  ⚠ {n_col} file(s) collapsed" if n_col > 0 else ""
-            ax.set_title(f"{label}\nRMSE={rmse:.1f}mm{warn}",
-                         fontsize=11, fontweight='bold',
-                         color='darkred' if n_col > 0 else 'black')
-        else:
-            ax.set_title(label, fontsize=11)
-        ax.set_xlabel("X (mm)")
-        ax.set_ylabel("Y (mm)")
-        ax.legend(fontsize=9)
-        ax.set_aspect('equal')
-        ax.grid(True, ls='--', alpha=0.3)
-    for ax in axes[n:]:
-        ax.set_visible(False)
+        warn = f" ⚠{n_col}" if n_col > 0 else ""
+        lw = 2.0 if label != "Raw+LS" else 1.2
+        ls = '-'  if label != "Raw+LS" else '--'
+        ax.plot(pos[:, 0], pos[:, 1],
+                color=color, lw=lw, ls=ls, alpha=0.75,
+                label=f"{label}{warn}  RMSE={rmse:.1f}mm")
+
+    for nm, pt in zip(["A", "B", "C", "D"], WAYPOINTS[:4]):
+        ax.scatter(*pt, s=90, color='black', zorder=10)
+        ax.annotate(nm, pt, textcoords="offset points",
+                    xytext=(6, 4), fontsize=13, fontweight='bold')
+
+    for j, (ax_, ay_) in enumerate(ANCHORS):
+        ax.scatter(ax_, ay_, s=100, marker='s', color='red', zorder=10)
+        ax.annotate(f"A{j+1}", (ax_, ay_), textcoords="offset points",
+                    xytext=(5, 5), fontsize=10, color='red')
+
+    ax.set_xlabel("X (mm)", fontsize=12)
+    ax.set_ylabel("Y (mm)", fontsize=12)
+    ax.legend(fontsize=10, loc='upper right')
+    ax.set_aspect('equal')
+    ax.grid(True, ls='--', alpha=0.3)
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Trajectories → {save_path}")
@@ -856,7 +859,6 @@ def plot_bar(metrics_dict, save_path):
         ax.set_ylabel("mm", fontsize=12)
         ax.set_title(mlabel, fontsize=13, fontweight='bold')
         ax.grid(True, axis='y', ls='--', alpha=0.3)
-    plt.suptitle("V18 — Method Comparison  (hatch = motion collapsed)", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Bar → {save_path}")
@@ -870,7 +872,7 @@ def main():
     print("=" * 70)
     print("  V18: Robust & Adaptive UKF — UWB Indoor Positioning")
     print("=" * 70)
-    print("  1. Raw+WLS      — Weighted Least Squares (baseline)")
+    print("  1. Raw+LS      — Weighted Least Squares (baseline)")
     print("  2. UKF          — Unscented Kalman Filter chuẩn")
     print("  3. Huber-UKF    — IRLS với Huber M-estimator")
     print("  4. MCC-UKF      — Maximum Correntropy Criterion UKF")

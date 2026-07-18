@@ -503,7 +503,7 @@ def evaluate_files(file_paths, gt_xy,
 
         # 2. UKF-2D (Đo thời gian chạy bộ lọc UKF không adaptive)
         t_start_ukf = time.perf_counter()
-        ukf_pos = ukf2d_filter_file(dist_raw, q=q, r=r_base)
+        ukf_pos = ukf2d_filter_file(dist_raw, q=UKF2D_Q, r=UKF2D_R)
         t_end_ukf = time.perf_counter()
         time_ukf_file = t_end_ukf - t_start_ukf
 
