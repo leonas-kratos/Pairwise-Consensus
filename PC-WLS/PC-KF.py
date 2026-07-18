@@ -58,11 +58,11 @@ KF_R = 300.0
 
 # PC-KF default params
 PCKF_Q       = 0.01
-PCKF_R_BASE  = 200.0
-PCKF_R_SCALE = 20.0    # R_i = R_base * (1 + r_scale * (1 - score_i))
-PCKF_SIGMA   = 150.0   # mm — ngưỡng innovation "bình thường"
+PCKF_R_BASE  = 300.0
+PCKF_R_SCALE = 5.0    # R_i = R_base * (1 + r_scale * (1 - score_i))
+PCKF_SIGMA   = 10.0   # mm — ngưỡng innovation "bình thường"
 
-DO_GRID_SEARCH  = True
+DO_GRID_SEARCH  = False
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_vKFPC"
 
@@ -107,8 +107,8 @@ def wls_position(distances, anchors=ANCHORS):
         di     = max(distances[i], 1.0)
         rows.append([2*(xi-x0), 2*(yi-y0)])
         b.append((d0**2 - di**2) - (x0**2 - xi**2) - (y0**2 - yi**2))
-        #w.append(1.0 / di)
-        w.append(1.0 / 1.0)
+        w.append(1.0 / di)
+        #w.append(1.0 / 1.0)
     A  = np.array(rows, dtype=float)
     bv = np.array(b,    dtype=float)
     W  = np.diag(w)

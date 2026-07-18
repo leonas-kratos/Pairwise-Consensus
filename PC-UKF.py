@@ -67,9 +67,9 @@ UKF2D_KAPPA = 0.0    # UKF secondary scaling
 
 # PC-UKF-2D params
 PCUKF2D_Q       = 0.001
-PCUKF2D_R_BASE  = 40.0
-PCUKF2D_R_SCALE = 10.0
-PCUKF2D_SIGMA   = 200.0
+PCUKF2D_R_BASE  = 10.0
+PCUKF2D_R_SCALE = 20.0
+PCUKF2D_SIGMA   = 10.0
 
 # PC-LS params (no filter state, just weighted WLS per timestep)
 PCLS_R_BASE  = 200.0
@@ -128,7 +128,7 @@ def wls_position(distances, anchors=ANCHORS, weights=None):
         rows.append([2*(xi-x0), 2*(yi-y0)])
         b.append((d0**2 - di**2) - (x0**2 - xi**2) - (y0**2 - yi**2))
         # Trọng số: dùng weights nếu có, ngược lại dùng 1/di
-        w.append(weights[i] if weights is not None else 1.0 / di)
+        w.append(weights[i] if weights is not None else 1.0 / 1.0)
     A  = np.array(rows, dtype=float)
     bv = np.array(b,    dtype=float)
     W  = np.diag(w)

@@ -64,15 +64,15 @@ EKF2D_R     = 300.0  # Measurement noise (mm^2) per anchor
 
 # PC-EKF-2D params
 PCEKF2D_Q       = 0.01
-PCEKF2D_R_BASE  = 200.0
-PCEKF2D_R_SCALE = 10.0
-PCEKF2D_SIGMA   = 50.0
+PCEKF2D_R_BASE  = 300.0
+PCEKF2D_R_SCALE = 20.0
+PCEKF2D_SIGMA   = 200.0
 
 # PC scoring dùng KF 1D để tính innovation (giống V13a)
 PC_KF_Q = 0.01
 PC_KF_R = 200.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_vPCEKF"
 
@@ -116,7 +116,7 @@ def wls_position(distances, anchors=ANCHORS):
         di     = max(distances[i], 1.0)
         rows.append([2*(xi-x0), 2*(yi-y0)])
         b.append((d0**2 - di**2) - (x0**2 - xi**2) - (y0**2 - yi**2))
-        w.append(1.0 / 1.0)
+        w.append(1.0 / di)
     A  = np.array(rows, dtype=float)
     bv = np.array(b,    dtype=float)
     W  = np.diag(w)
@@ -708,8 +708,8 @@ def main():
     import random; random.seed(42); np.random.seed(42)
     perm     = np.random.permutation(n)
     shuffled = [all_files[i] for i in perm]
-    n_train  = min(0, n)
-    n_val    = min(0, max(0, n - n_train))
+    n_train  = min(4, n)
+    n_val    = min(2, max(0, n - n_train))
     train_files = shuffled[:n_train]
     val_files   = shuffled[n_train:n_train + n_val]
     test_files  = shuffled[n_train + n_val:]
