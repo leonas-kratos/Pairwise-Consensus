@@ -60,7 +60,7 @@ N_ANCHORS  = 4
 
 # EKF-2D params
 EKF2D_Q     = 0.01    # Process noise (mm^2) — scalar, dùng cho I*Q
-EKF2D_R     = 300.0  # Measurement noise (mm^2) per anchor
+EKF2D_R     = 100.0  # Measurement noise (mm^2) per anchor
 
 # PC-EKF-2D params
 PCEKF2D_Q       = 0.01

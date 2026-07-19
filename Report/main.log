@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026/Arch Linux) (preloaded format=pdflatex 2026.6.27)  18 JUL 2026 16:48
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026/Arch Linux) (preloaded format=pdflatex 2026.6.27)  18 JUL 2026 21:53
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
@@ -511,6 +511,16 @@ LaTeX Font Info:    Trying to load font information for U+msb on input line 43.
  (/usr/share/texmf-dist/tex/latex/amsfonts/umsb.fd
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )
+Underfull \hbox (badness 1817) in paragraph at lines 59--60
+[]\OT1/ptm/m/n/10 Robust Kalman fil-ter-ing vari-ants such as the Huber-
+ []
+
+
+Underfull \hbox (badness 10000) in paragraph at lines 64--65
+[]\OT1/ptm/b/n/10 Label-free\OT1/ptm/m/n/10 : re-quires no la-beled NLOS data or
+ []
+
+
 Underfull \hbox (badness 2564) in paragraph at lines 76--77
 []\OT1/ptm/m/n/10 Consider $\OML/cmm/m/it/10 N$ \OT1/ptm/m/n/10 an-chors at known 2D po-si-tions $\OT1/cmr/bx/n/10 a[] \OT1/cmr/m/n/10 =
  []
@@ -527,45 +537,42 @@ Underfull \hbox (badness 3735) in paragraph at lines 165--165
 
 LaTeX Font Info:    Font shape `OMS/ptm/m/n' in size <10> not available
 (Font)              Font shape `OMS/cmsy/m/n' tried instead on input line 170.
-
-Underfull \hbox (badness 1603) in paragraph at lines 204--205
+<figures/NLOS.png, id=114, 858.5676pt x 409.0482pt>
+File: figures/NLOS.png Graphic file (type png)
+<use figures/NLOS.png>
+Package pdftex.def Info: figures/NLOS.png  used on input line 190.
+(pdftex.def)             Requested size: 516.0pt x 245.8365pt.
+[2]
+Underfull \hbox (badness 1603) in paragraph at lines 211--212
 []\OT1/ptm/b/n/10 EKF $\OMS/cmsy/m/n/10 !$ \OT1/ptm/b/n/10 PC-EKF\OT1/ptm/m/n/10 : RMSE re-duced from 112.4 to
  []
 
 
-Underfull \hbox (badness 1418) in paragraph at lines 205--206
+Underfull \hbox (badness 1418) in paragraph at lines 212--213
 []\OT1/ptm/b/n/10 UKF $\OMS/cmsy/m/n/10 !$ \OT1/ptm/b/n/10 PC-UKF\OT1/ptm/m/n/10 : RMSE re-duced from 106.5 to
  []
 
-[2]
-<figures/NLOS.png, id=148, 496.7358pt x 1004.0712pt>
-File: figures/NLOS.png Graphic file (type png)
-<use figures/NLOS.png>
-Package pdftex.def Info: figures/NLOS.png  used on input line 268.
-(pdftex.def)             Requested size: 252.0pt x 509.37306pt.
- [3 <./figures/NLOS.png>] [4
-
-] (./main.aux)
+[3 <./figures/NLOS.png>] [4] (./main.aux)
  ***********
 LaTeX2e <2025-11-01>
 L3 programming layer <2026-01-19>
  ***********
 Package rerunfilecheck Info: File `main.out' has not changed.
-(rerunfilecheck)             Checksum: DD5CBBE0C1AF9F0ED80F8EBC4619DF5C;2829.
+(rerunfilecheck)             Checksum: ECF27F3AF0B01CF2D9991163EE602D6C;2653.
  ) 
 Here is how much of TeX's memory you used:
- 16997 strings out of 469515
- 326941 string characters out of 5470807
- 734641 words of memory out of 5000000
- 45390 multiletter control sequences out of 15000+600000
+ 17004 strings out of 469515
+ 327020 string characters out of 5470807
+ 731737 words of memory out of 5000000
+ 45394 multiletter control sequences out of 15000+600000
  675789 words of font info for 140 fonts, out of 8000000 for 9000
  14 hyphenation exceptions out of 8191
- 75i,10n,80p,1160b,1027s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,10n,80p,1242b,1027s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmbsy10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi5.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr5.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/share/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy9.pfb></usr/share/texmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/share/texmf-dist/fonts/type1/urw/times/utmbi8a.pfb></usr/share/texmf-dist/fonts/type1/urw/times/utmr8a.pfb></usr/share/texmf-dist/fonts/type1/urw/times/utmri8a.pfb>
-Output written on main.pdf (4 pages, 525448 bytes).
+Output written on main.pdf (4 pages, 461181 bytes).
 PDF statistics:
- 258 PDF objects out of 1000 (max. 8388607)
- 211 compressed objects within 3 object streams
- 60 named destinations out of 1000 (max. 500000)
- 134 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 267 PDF objects out of 1000 (max. 8388607)
+ 220 compressed objects within 3 object streams
+ 63 named destinations out of 1000 (max. 500000)
+ 126 words of extra memory for PDF output out of 10000 (max. 10000000)
 

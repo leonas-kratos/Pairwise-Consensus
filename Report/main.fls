@@ -260,6 +260,12 @@ INPUT /usr/share/texmf-dist/fonts/vf/adobe/times/ptmri7t.vf
 INPUT /usr/share/texmf-dist/fonts/tfm/adobe/times/ptmri8r.tfm
 INPUT /usr/share/texmf-dist/fonts/vf/adobe/times/ptmb7t.vf
 INPUT /usr/share/texmf-dist/fonts/tfm/adobe/times/ptmb8r.tfm
+INPUT ./figures/NLOS.png
+INPUT ./figures/NLOS.png
+INPUT ./figures/NLOS.png
+INPUT ./figures/NLOS.png
+INPUT ./figures/NLOS.png
+INPUT /usr/share/texmf-dist/fonts/vf/adobe/times/ptmr7t.vf
 INPUT /usr/share/texmf-dist/fonts/tfm/public/cm/cmr8.tfm
 INPUT /usr/share/texmf-dist/fonts/tfm/public/cm/cmmi8.tfm
 INPUT /usr/share/texmf-dist/fonts/tfm/public/cm/cmsy8.tfm
@@ -269,12 +275,6 @@ INPUT /usr/share/texmf-dist/fonts/tfm/public/amsfonts/symbols/msbm10.tfm
 INPUT /usr/share/texmf-dist/fonts/tfm/public/cm/cmbx8.tfm
 INPUT /usr/share/texmf-dist/fonts/tfm/public/amsfonts/cmextra/cmmib8.tfm
 INPUT /usr/share/texmf-dist/fonts/tfm/public/amsfonts/cmextra/cmbsy8.tfm
-INPUT /usr/share/texmf-dist/fonts/vf/adobe/times/ptmr7t.vf
-INPUT ./figures/NLOS.png
-INPUT ./figures/NLOS.png
-INPUT ./figures/NLOS.png
-INPUT ./figures/NLOS.png
-INPUT ./figures/NLOS.png
 INPUT /usr/share/texmf-dist/fonts/vf/adobe/times/ptmb7t.vf
 INPUT /usr/share/texmf-dist/fonts/tfm/adobe/times/ptmb8r.tfm
 INPUT /usr/share/texmf-dist/fonts/vf/adobe/times/ptmri7t.vf

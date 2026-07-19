@@ -32,57 +32,73 @@ warnings.filterwarnings("ignore", category=UserWarning)
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 ANCHORS = np.array([
-    [4000, 8800],
-    [0,    8800],
-    [0,    0   ],
-    [4000, 0   ],
+    [8800, 0   ],   # A1
+    [8800, 4000],   # A2
+    [0,    4000],   # A3
+    [0,    0   ],   # A4
+], dtype=float)
+
+WAYPOINTS = np.array([
+    [400.0,  3200.0],   # A
+    [400.0,  1000.0],   # B
+    [8000.0, 1000.0],   # C
+    [8000.0, 3200.0],   # D
+    [400.0,  3200.0],   # A
 ], dtype=float)
 
 ANCHOR_HEIGHT = 1400.0
-
-WAYPOINTS = np.array([
-    [800.0,  400.0],
-    [3000.0, 400.0],
-    [3000.0, 8000.0],
-    [800.0,  8000.0],
-    [800.0,  400.0],
-], dtype=float)
 
 SPEED      = 200.0
 GT_SPACING = 5.0
 N_ANCHORS  = 4
 
 # ─── Standard UKF ────────────────────────────────────────────────────
-UKF_STD_Q      = 0.001
-UKF_STD_R      = 50.0
+UKF_STD_Q      = 0.01
+UKF_STD_R      = 300.0
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
-# HUBER_Q       = 0.001
-# HUBER_R       = 40.0
-# HUBER_DELTA   = 20.0
-# HUBER_MAXITER = 5
-
 HUBER_Q       = 0.001
-HUBER_R       = 20.0
-HUBER_DELTA   = 2.5
+HUBER_R       = 5.0
+HUBER_DELTA   = 20.0
 HUBER_MAXITER = 5
+
+# HUBER_Q       = 0.001
+# HUBER_R       = 20.0
+# HUBER_DELTA   = 2.5
+# HUBER_MAXITER = 5
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
 MCC_Q          = 0.001
-MCC_R          = 100.0
-MCC_KERNEL_BW  = 1700.0
+MCC_R          = 10.0
+MCC_KERNEL_BW  = 1100.0
 MCC_MAXITER    = 5
 
+# MCC_Q          = 0.001
+# MCC_R          = 100.0
+# MCC_KERNEL_BW  = 1700.0
+# MCC_MAXITER    = 5
+
 # ─── PC-UKF-2D ─────────────────
+PCUKF_Q        = 0.001
+PCUKF_R_BASE   = 10.0
+PCUKF_R_SCALE  = 15.0
+PCUKF_SIGMA    = 200.0
+
 # PCUKF_Q        = 0.001
 # PCUKF_R_BASE   = 50.0
 # PCUKF_R_SCALE  = 5.0
-# PCUKF_SIGMA    = 300.0
+# PCUKF_SIGMA    = 1.0
 
-PCUKF_Q        = 0.001
-PCUKF_R_BASE   = 100.0
-PCUKF_R_SCALE  = 1.0
-PCUKF_SIGMA    = 20.0
+# ─── GUKF (Gaussian-smoothed UKF) ────────────────────────────────────
+GUKF_Q      = 0.001
+GUKF_R      = 50.0
+GUKF_SIGMA  = 5.0   # σ của Gaussian template (paper dùng σ=1)
+GUKF_N_HALF = 4     # n trong template dài 2n+1=5 (như paper)
+
+# GUKF_Q      = 0.001
+# GUKF_R      = 200.0
+# GUKF_SIGMA  = 5.0   # σ của Gaussian template (paper dùng σ=1)
+# GUKF_N_HALF = 4     # n trong template dài 2n+1=5 (như paper)
 
 # ─── UKF common ──────────────────────────────────────────────────────
 UKF_ALPHA = 1e-3
@@ -94,7 +110,7 @@ DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 0.80
+MOTION_RATIO_MIN = 1.00
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -483,6 +499,93 @@ class PCUKF2D:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  6. GUKF — Gaussian Unscented Kalman Filter
+#     Ref: Sun et al., IET Radar Sonar Navig. 2025 (rsn2.12682)
+#
+#  Ý tưởng: dùng Gaussian template h(x) ~ N(0,σ) để làm mượt (smooth)
+#  chuỗi khoảng cách đo được bằng tích chập vòng tròn, sau đó đưa
+#  khoảng cách đã lọc vào UKF thông thường.
+#
+#  Template chiều dài 2n+1, kernel:  h[k] = exp(-k²/(2σ²)) / Z
+#  Tích chập: R'_{i,k} = Σ_{j=-n}^{n}  R_{i,k+j} · h[j]
+#  Vì cần R_{i,k-n..k+n} tại bước k, bộ lọc giữ lại buffer
+#  2n+1 quan sát gần nhất rồi áp dụng kernel tại mỗi bước.
+# ══════════════════════════════════════════════════════════════════════
+def _make_gaussian_kernel(n_half, sigma):
+    """Tạo kernel Gaussian 1D chuẩn hoá, chiều dài 2*n_half+1."""
+    idx = np.arange(-n_half, n_half + 1, dtype=float)
+    h   = np.exp(-0.5 * idx**2 / (sigma**2 + 1e-12))
+    return h / h.sum()
+
+
+class GUKF:
+    """Gaussian-smoothed UKF: làm mượt khoảng cách trước khi vào UKF."""
+
+    def __init__(self, q=GUKF_Q, r=GUKF_R,
+                 sigma=GUKF_SIGMA, n_half=GUKF_N_HALF):
+        self.n      = 2
+        self.Q_mat  = np.eye(2) * q
+        self.R_mat  = np.eye(N_ANCHORS) * r
+        self.kernel = _make_gaussian_kernel(n_half, sigma)  # shape (2n+1,)
+        self.n_half = n_half
+        self.win    = 2 * n_half + 1          # cửa sổ buffer
+        self.Wm, self.Wc, self.c = ukf_weights(self.n)
+        self.x    = None
+        self.P    = None
+        # Buffer lưu 'win' quan sát gần nhất (mỗi hàng = N_ANCHORS khoảng cách)
+        self._buf = []
+
+    def init(self, x0):
+        self.x   = x0.astype(float).copy()
+        self.P   = np.eye(self.n) * 1e6
+        self._buf = []
+
+    def _smooth(self, z_raw):
+        """Trả về khoảng cách đã làm mượt bằng Gaussian convolution."""
+        self._buf.append(z_raw.copy())
+        if len(self._buf) > self.win:
+            self._buf.pop(0)
+
+        buf = np.array(self._buf)              # shape (<=win, N_ANCHORS)
+        L   = len(buf)
+
+        if L < self.win:
+            # Chưa đủ buffer — dùng L mẫu cuối cùng của kernel và renormalise
+            h_cut = self.kernel[self.win - L:]  # lấy L phần tử cuối
+            h_cut = h_cut / h_cut.sum()
+            return h_cut @ buf                 # shape (N_ANCHORS,)
+        else:
+            return self.kernel @ buf           # shape (N_ANCHORS,)
+
+    def step(self, z_raw):
+        if self.x is None:
+            return np.full(2, np.nan)
+
+        z_smooth = self._smooth(z_raw)
+
+        # ── UKF standard steps ──────────────────────────────────────
+        x_pred = self.x.copy()
+        P_pred = self.P + self.Q_mat
+
+        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
+            x_pred, P_pred, self.Wm, self.Wc, self.c)
+
+        Pzz_eff = Pzz_no_R + self.R_mat
+        innov   = z_smooth - z_hat
+
+        try:
+            K = Pxz @ np.linalg.inv(Pzz_eff)
+        except np.linalg.LinAlgError:
+            self.x = x_pred
+            self.P = make_spd(P_pred)
+            return self.x.copy()
+
+        self.x = x_pred + K @ innov
+        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        return self.x.copy()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  FILTER WRAPPERS
 # ══════════════════════════════════════════════════════════════════════
 def run_filter(filt_class, dist_raw, **kwargs):
@@ -535,6 +638,8 @@ METHODS = {
     "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
     "PC-UKF-2D" : (PCUKF2D,    dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
                                      r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)),
+    "GUKF"      : (GUKF,        dict(q=GUKF_Q,      r=GUKF_R,
+                                     sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)),
 }
 
 COLORS = {
@@ -543,6 +648,7 @@ COLORS = {
     "Huber-UKF" : '#E91E63',
     "MCC-UKF"   : '#FF9800',
     "PC-UKF-2D" : '#9C27B0',
+    "GUKF"      : '#4CAF50',   # xanh lá
 }
 
 
@@ -697,7 +803,7 @@ def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
         'r'    : [1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
-        'delta': [1.0, 1.5, 2.0, 2.5, 5.0],
+        'delta': [1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 20.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -718,8 +824,8 @@ def grid_search_huber(file_paths, gt_xy, expected_path_length):
 
 def grid_search_mcc(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'        : [10.0, 50.0, 100.0, 200.0],
-        'kernel_bw': [1100.0, 1200.0, 1300.0, 1700.0],
+        'r'        : [10.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0],
+        'kernel_bw': [100.0, 200.0, 500.0, 1100.0, 1200.0, 1300.0, 1700.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -740,9 +846,9 @@ def grid_search_mcc(file_paths, gt_xy, expected_path_length):
 
 def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r_base' : [50.0, 100.0, 200.0],
-        'r_scale': [1.0, 3.0, 5.0, 10.0, 20.0],
-        'sigma'  : [20.0, 30.0, 50.0, 100.0, 200.0],
+        'r_base' : [10.0, 25.0, 50.0, 100.0, 150.0, 200.0],
+        'r_scale': [3.0, 5.0, 10.0, 15.0],
+        'sigma'  : [1.0, 3.0, 5.0, 7.0, 10.0, 100.0, 200.0, 300.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -758,6 +864,29 @@ def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
             best = params.copy()
     tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
     print(f"  Best PC-UKF-2D: RMSE={best_rmse:.1f}mm{tag} | r_base={best['r_base']} r_scale={best['r_scale']} sigma={best['sigma']}")
+    return best
+
+
+def grid_search_gukf(file_paths, gt_xy, expected_path_length):
+    grid = {
+        'r'      : [10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
+        'sigma'  : [0.5, 1.0, 2.0, 3.0, 5.0],
+        'n_half' : [1, 2, 3, 4],
+    }
+    keys   = list(grid.keys())
+    combos = list(itertools.product(*[grid[k] for k in keys]))
+    print(f"\n  Grid search GUKF: {len(combos)} combinations...")
+    best_rmse = float('inf')
+    best = dict(q=GUKF_Q, r=GUKF_R, sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)
+    for combo in combos:
+        params = dict(zip(keys, combo))
+        params['q'] = GUKF_Q
+        rmse = _eval_rmse_single(GUKF, params, file_paths, gt_xy, expected_path_length)
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best = params.copy()
+    tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
+    print(f"  Best GUKF: RMSE={best_rmse:.1f}mm{tag} | r={best['r']} sigma={best['sigma']} n_half={best['n_half']}")
     return best
 
 
@@ -824,7 +953,7 @@ def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
 
     ax.set_xlabel("X (mm)", fontsize=12)
     ax.set_ylabel("Y (mm)", fontsize=12)
-    ax.legend(fontsize=10, loc='upper right')
+    ax.legend(fontsize=8, loc='best')
     ax.set_aspect('equal')
     ax.grid(True, ls='--', alpha=0.3)
 
@@ -870,13 +999,14 @@ def plot_bar(metrics_dict, save_path):
 # ══════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 70)
-    print("  V18: Robust & Adaptive UKF — UWB Indoor Positioning")
+    print("  V19: Robust & Adaptive UKF — UWB Indoor Positioning")
     print("=" * 70)
     print("  1. Raw+LS      — Weighted Least Squares (baseline)")
     print("  2. UKF          — Unscented Kalman Filter chuẩn")
     print("  3. Huber-UKF    — IRLS với Huber M-estimator")
     print("  4. MCC-UKF      — Maximum Correntropy Criterion UKF")
     print("  5. PC-UKF-2D    — Pairwise Consensus UKF (đã tuning V15)")
+    print("  6. GUKF         — Gaussian-smoothed UKF (Sun et al. 2025)")
     print("=" * 70)
     print(f"\n  Motion collapse detection: ratio_min={MOTION_RATIO_MIN:.0%}")
 
@@ -901,13 +1031,15 @@ def main():
     if DO_GRID_SEARCH:
         print("\n  [Grid Search] Tuning tất cả filter (với motion penalty)...")
 
-        best_huber = grid_search_huber(eval_files, gt_xy, expected_path_length)
         best_mcc   = grid_search_mcc(eval_files, gt_xy, expected_path_length)
         best_pc    = grid_search_pcukf(eval_files, gt_xy, expected_path_length)
+        best_gukf  = grid_search_gukf(eval_files, gt_xy, expected_path_length)
+        best_huber = grid_search_huber(eval_files, gt_xy, expected_path_length)
 
         METHODS["Huber-UKF"] = (HuberUKF,    best_huber)
         METHODS["MCC-UKF"]   = (MCCUKF,      best_mcc)
         METHODS["PC-UKF-2D"] = (PCUKF2D,     best_pc)
+        METHODS["GUKF"]      = (GUKF,         best_gukf)
 
     # ── Evaluate ──────────────────────────────────────────────────────
     errors, positions, collapse_warn = evaluate_files(

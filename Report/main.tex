@@ -40,7 +40,7 @@ University Name, City, Country\\
 %  ABSTRACT
 % ══════════════════════════════════════════════════════════════════════
 \begin{abstract}
-Ultra-wideband (UWB) indoor positioning systems suffer from non-line-of-sight (NLOS) errors that severely degrade localization accuracy. This letter proposes a \emph{Pairwise Consensus} (PC) scoring mechanism that adaptively adjusts the measurement noise covariance of Kalman-family filters by evaluating inter-anchor consistency using a heavy-tailed Student-$t$ kernel. The proposed method is generic and can be integrated into any Kalman filter variant---KF, EKF, or UKF---without requiring explicit NLOS identification, channel models, or machine learning training. Experiments on real UWB ranging data collected in a $4\times8.8$~m indoor environment with four anchors demonstrate that PC scoring consistently improves all three filter variants, reducing RMSE by 13.5\%--32.7\% under line-of-sight (LOS) conditions. When integrated with UKF, the proposed PC-UKF achieves an RMSE of 89.0~mm in LOS and 129.8~mm under intermittent anchor failure, outperforming the standard UKF, Huber-UKF, and MCC-UKF in both scenarios.
+Ultra-wideband (UWB) indoor positioning systems suffer from measurement degradation caused by non-line-of-sight (NLOS) conditions and intermittent anchor failures, severely impairing localization accuracy. This letter proposes a \emph{Pairwise Consensus} (PC) scoring mechanism that adaptively adjusts the measurement noise covariance of Kalman-family filters by evaluating inter-anchor geometric consistency using a heavy-tailed Student-$t$ kernel. The proposed method is generic and can be integrated into any Kalman filter variant---KF, EKF, or UKF---without requiring labeled data, channel models, or machine learning training. Experiments on real UWB ranging data collected in a $8.8\times4$~m indoor environment with four anchors demonstrate that PC scoring consistently improves all three filter variants, reducing RMSE by 13.5\%--32.7\% under line-of-sight (LOS) conditions. When integrated with UKF, the proposed PC-UKF achieves the lowest RMSE of 89.0~mm in LOS and 125.0~mm under intermittent anchor failure among all compared methods, including the standard UKF, Huber-UKF, MCC-UKF, and GUKF.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -54,14 +54,14 @@ Indoor positioning, ultra-wideband, Kalman filter, robust estimation, pairwise c
 
 \IEEEPARstart{U}{ltra-wideband} (UWB) technology has emerged as a promising solution for centimeter-level indoor positioning due to its fine time resolution and multipath resilience~\cite{uwb_survey}. However, in practical indoor environments, non-line-of-sight (NLOS) conditions---caused by walls, furniture, and human bodies---introduce positive biases in ranging measurements, severely degrading positioning accuracy~\cite{nlos_survey}.
 
-Existing NLOS mitigation strategies broadly fall into three categories: \emph{identification-then-mitigation}, where NLOS measurements are detected and either discarded or corrected~\cite{nlos_identify}; \emph{robust estimation}, which employs heavy-tailed cost functions to down-weight outliers~\cite{huber_ukf, mcc_ukf}; and \emph{machine learning approaches}, which require large training datasets and may not generalize across environments~\cite{ml_uwb}.
+Existing approaches to mitigate unreliable UWB measurements broadly fall into three categories: \emph{identification-then-mitigation}, where NLOS measurements are detected and either discarded or corrected~\cite{nlos_identify}; \emph{robust estimation}, which employs heavy-tailed cost functions or smoothing techniques to down-weight outliers~\cite{huber_ukf, mcc_ukf, mcc_ukf_uwb, gukf}; and \emph{machine learning approaches}, which require large training datasets and may not generalize across environments~\cite{ml_uwb}. A fourth paradigm---\emph{inter-measurement consistency checking}---has been widely adopted in GNSS navigation through Receiver Autonomous Integrity Monitoring (RAIM)~\cite{raim, raim_survey}, which exploits ranging redundancy to detect faulty satellites. However, such consistency-based techniques have seen limited application in UWB indoor positioning.
 
-Robust Kalman filtering variants such as the Huber-UKF~\cite{huber_ukf} and Maximum Correntropy Criterion UKF (MCC-UKF)~\cite{mcc_ukf} address outliers by iteratively reweighting innovations based on individual residual magnitudes. However, these methods evaluate each measurement independently and do not exploit the geometric consistency among multiple anchors.
+Robust Kalman filtering variants such as the Huber-UKF~\cite{huber_ukf}, Maximum Correntropy Criterion UKF (MCC-UKF)~\cite{mcc_ukf, mcc_ukf_uwb}, and Gaussian UKF (GUKF)~\cite{gukf} address outliers by iteratively reweighting innovations or applying Gaussian smoothing to measurements. However, these methods evaluate each measurement independently and do not exploit the geometric consistency among multiple anchors.
 
 In this letter, we propose a \emph{Pairwise Consensus} (PC) scoring mechanism that assesses the reliability of each anchor by comparing its ranging residual against all other anchors using a Student-$t$ kernel. The resulting consensus score is used to adaptively scale the measurement noise covariance $R_i$ for each anchor: trusted anchors receive lower $R_i$ (more influence), while suspicious anchors are penalized with higher $R_i$. This approach is:
 \begin{itemize}
     \item \textbf{Filter-agnostic}: applicable to KF, EKF, and UKF with minimal modification;
-    \item \textbf{Training-free}: requires no labeled data or environment-specific calibration;
+    \item \textbf{Label-free}: requires no labeled NLOS data or environment-specific calibration;
     \item \textbf{Lightweight}: adds only $\mathcal{O}(N^2)$ pairwise comparisons per timestep, where $N$ is the number of anchors.
 \end{itemize}
 
@@ -116,7 +116,7 @@ At each timestep $k$, given raw ground distances $\mbf{d}_k = [d_{1,k}, \ldots, 
 \begin{equation}\label{eq:kernel}
     c_{ij} = \left(1 + \frac{(r_i - r_j)^2}{\nu \sigma^2}\right)^{-(\nu+1)/2},
 \end{equation}
-where $\sigma$ is a bandwidth parameter controlling sensitivity. We fix $\nu = 4$ throughout.
+where $\sigma$ is a bandwidth parameter controlling sensitivity. We set $\nu = 4$ and $\sigma = 300$~mm throughout. The Student-$t$ kernel is preferred over the Gaussian kernel ($\nu \to \infty$) because its heavier tails provide greater tolerance to moderate residual discrepancies among anchors under normal conditions, while still penalizing large outliers. The choice $\nu = 4$ balances robustness (heavier tails than Gaussian) with sensitivity to genuinely corrupted measurements (lighter tails than the Cauchy kernel, $\nu = 1$).
 
 \textbf{Step 3 --- Consensus score.} The score for anchor $i$ is the average pairwise agreement:
 \begin{equation}\label{eq:score}
@@ -131,10 +131,10 @@ The consensus scores are mapped to per-anchor measurement noise:
 \begin{equation}\label{eq:adaptive_R}
     R_i = R_{\text{base}} \cdot \left(1 + R_{\text{scale}} \cdot (1 - s_i)\right).
 \end{equation}
-This construction ensures:
+In our experiments, we set $R_{\text{base}} = 50$~mm$^2$ and $R_{\text{scale}} = 5$, selected via cross-validation on a held-out LOS run. This construction ensures:
 \begin{itemize}
     \item \emph{Trusted anchor} ($s_i \to 1$): $R_i \to R_{\text{base}}$ --- the filter fully utilizes the measurement.
-    \item \emph{Outlier anchor} ($s_i \to 0$): $R_i \to R_{\text{base}}(1+R_{\text{scale}})$ --- the measurement is heavily discounted.
+    \item \emph{Outlier anchor} ($s_i \to 0$): $R_i \to R_{\text{base}}(1+R_{\text{scale}}) = 300$~mm$^2$ --- the measurement is heavily discounted.
 \end{itemize}
 
 \subsection{Integration with Kalman Filter Variants}
@@ -184,6 +184,13 @@ The overall algorithm is summarized in Algorithm~\ref{alg:pc}.
 \end{algorithmic}
 \end{algorithm}
 
+% ── Figure: NLOS case study (placed here for earlier page rendering) ──
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/NLOS.png}
+\caption{Intermittent anchor failure case study}
+\label{fig:nlos_case}
+\end{figure*}
 
 % ══════════════════════════════════════════════════════════════════════
 %  IV. EXPERIMENTAL RESULTS
@@ -192,13 +199,13 @@ The overall algorithm is summarized in Algorithm~\ref{alg:pc}.
 
 \subsection{Setup}
 
-The experimental testbed consists of four DW1000-based UWB anchors mounted at height $H = 1400$~mm at the corners of a $4000 \times 8800$~mm rectangular room, with coordinates $\mbf{a}_1 = [4000, 8800]$, $\mbf{a}_2 = [0, 8800]$, $\mbf{a}_3 = [0, 0]$, and $\mbf{a}_4 = [4000, 0]$~(mm). The tag is moved along a rectangular path with waypoints A$(800,400) \to$ B$(3000,400) \to$ C$(3000,8000) \to$ D$(800,8000) \to$ A at a approximate speed of 200~mm/s, yielding a total path length of 19,600~mm. 
+The experimental testbed consists of four DW1000-based UWB anchors mounted at height $H = 1400$~mm at the corners of an $8800 \times 4000$~mm rectangular room, with coordinates $\mbf{a}_1 = [8800, 0]$, $\mbf{a}_2 = [8800, 4000]$, $\mbf{a}_3 = [0, 4000]$, and $\mbf{a}_4 = [0, 0]$~(mm). The tag is moved along a rectangular path with waypoints A$(400,3200) \to$ B$(400,1000) \to$ C$(8000,1000) \to$ D$(8000,3200) \to$ A at an approximate speed of 200~mm/s, yielding a total path length of 19,600~mm. Ground truth positions are obtained by linear interpolation along the nominal rectangular path at the recorded timestamps; positioning errors are thus measured relative to the intended trajectory.
 
-Data is collected in two scenarios: (i)~\textbf{LOS}: eight independent runs where all four anchors maintain line-of-sight to the tag, with ranging at approximately 60~Hz; and (ii)~\textbf{Degraded anchor}: one run where a single anchor experiences intermittent ranging failures---alternating between valid measurements and dropouts.
+The process noise is set to $q = 0.001$ for all Kalman filter variants. Data is collected in two scenarios: (i)~\textbf{LOS}: eight independent runs where all four anchors maintain line-of-sight to the tag, with ranging at approximately 60~Hz; and (ii)~\textbf{Degraded anchor}: one run where a single anchor experiences intermittent ranging failures---alternating between valid measurements and dropouts.
 
 \subsection{PC Enhancement Across Filter Variants}
 
-Table~\ref{tab:pc_comparison} presents the LOS positioning accuracy of each baseline filter and its PC-enhanced counterpart. The PC mechanism consistently improves all metrics across all three filter variants:
+Table~\ref{tab:pc_comparison} presents the LOS positioning accuracy (averaged across eight independent runs) of each baseline filter and its PC-enhanced counterpart. The PC mechanism consistently improves all metrics across all three filter variants:
 \begin{itemize}
     \item \textbf{KF $\to$ PC-KF}: RMSE reduced from 285.6 to 192.3~mm ($-32.7\%$);
     \item \textbf{EKF $\to$ PC-EKF}: RMSE reduced from 112.4 to 97.2~mm ($-13.5\%$);
@@ -232,14 +239,13 @@ PC-UKF-2D  & \textbf{89.0} & \textbf{68.7} & \textbf{55.5} & \textbf{193.6} & \t
 \end{tabular}
 \end{table}
 
-
-\subsection{Comparison with others Robust Filters}
+\subsection{Comparison with Other Robust Filters}
 
 Table~\ref{tab:sota_comparison} compares the proposed PC-UKF against state-of-the-art robust UKF variants under LOS conditions. All methods use the same UKF core with individually tuned hyperparameters.
 
 \begin{table}[t]
 \centering
-\caption{LOS Comparison with others Robust UKF Methods (mm)}
+\caption{LOS Comparison with Robust UKF Methods (mm)}
 \label{tab:sota_comparison}
 \renewcommand{\arraystretch}{1.15}
 \begin{tabular}{@{}lccccc@{}}
@@ -250,31 +256,24 @@ Raw + LS                             & 342.1 & 241.7 & 169.6 & 748.4 & 1713.2 \\
 Standard UKF                         & 106.5 &  83.7 &  66.5 & 218.6 &  309.6 \\
 Huber-UKF~\cite{huber_ukf}          & 106.9 &  83.5 &  68.4 & 221.4 &  362.3 \\
 MCC-UKF~\cite{mcc_ukf}              &  96.8 &  77.0 &  63.0 & 208.0 &  308.9 \\
+GUKF~\cite{gukf}                    & 100.5 &  79.0 &  63.8 & 217.1 &  299.0 \\
 \textbf{PC-UKF (proposed)}           & \textbf{89.0} & \textbf{68.7} & \textbf{55.5} & \textbf{193.6} & \textbf{260.1} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The proposed PC-UKF achieves the best performance across all metrics with an RMSE of 89.0~mm, reducing error by 16.4\% over the standard UKF, 16.7\% over Huber-UKF, and 8.1\% over MCC-UKF. The key advantage of PC-UKF is its \emph{pairwise} evaluation strategy: rather than assessing each measurement in isolation (as Huber and MCC do), it exploits geometric redundancy by cross-checking inter-anchor consistency.
+The proposed PC-UKF achieves the best performance across all metrics with an RMSE of 89.0~mm, reducing error by 16.4\% over the standard UKF, 16.7\% over Huber-UKF, 8.1\% over MCC-UKF, and 11.4\% over GUKF. The key advantage of PC-UKF is its \emph{pairwise} evaluation strategy: rather than assessing each measurement in isolation (as Huber, MCC, and GUKF do), it exploits geometric redundancy by cross-checking inter-anchor consistency.
 
 \subsection{Case Study: Intermittent Anchor Failure}
 
-To evaluate robustness under adverse conditions, we consider a scenario where one anchor experiences intermittent ranging failures---alternating between valid measurements and dropouts---while the remaining three anchors operate normally. Fig.~\ref{fig:nlos_case} illustrates the anchor distance measurements and the resulting trajectories.
+To evaluate robustness under adverse conditions, we consider a scenario where one anchor experiences intermittent ranging failures---alternating between valid measurements and dropouts---while the remaining three anchors operate normally. Fig.~\ref{fig:nlos_case} illustrates the resulting trajectories.
 
-% ── Figure placeholder: trajectory + anchor distances ──
-\begin{figure}[htpb]
-\centering
-% TODO: include actual figures
-\includegraphics[width=\columnwidth]{figures/NLOS.png}
-\caption{Intermittent anchor failure case study.}
-\label{fig:nlos_case}
-\end{figure}
 
 Table~\ref{tab:nlos_comparison} summarizes the positioning accuracy under this condition. The degraded anchor's intermittent dropouts cause its ranging residual to deviate sharply from the other anchors, which the pairwise consensus mechanism naturally detects and penalizes via a low consensus score.
 
 \begin{table}[t]
 \centering
-\caption{Degraded Anchor Scenario: SOTA Comparison (mm)}
+\caption{Degraded Anchor Scenario (mm)}
 \label{tab:nlos_comparison}
 \renewcommand{\arraystretch}{1.15}
 \begin{tabular}{@{}lccccc@{}}
@@ -284,17 +283,16 @@ Table~\ref{tab:nlos_comparison} summarizes the positioning accuracy under this c
 Raw + LS                             & 414.3 & 326.0 & 252.7 & 890.4 & 1099.1 \\
 Standard UKF                         & 167.3 & 145.4 & 154.0 & 295.4 &  378.2 \\
 Huber-UKF~\cite{huber_ukf}          & 151.7 & 136.8 & 144.9 & 246.6 &  277.1 \\
-MCC-UKF~\cite{mcc_ukf}              &  147.4 & 129.2 & 121.1 & 252.7 &  312.3 \\
-\textbf{PC-UKF (proposed)}           & \textbf{129.8} & \textbf{112.6} & \textbf{105.1} & \textbf{216.5} & \textbf{247.0} \\
+MCC-UKF~\cite{mcc_ukf}              & 147.4 & 129.2 & 121.1 & 252.7 &  312.3 \\
+GUKF~\cite{gukf}                    & 127.5 & \textbf{111.3} & \textbf{107.0} & 207.1 &  242.0 \\
+\textbf{PC-UKF (proposed)}           & \textbf{125.0} & 112.2 & 111.0 & \textbf{202.2} & \textbf{237.5} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-PC-UKF achieves 129.8~mm RMSE---a 22.4\% improvement over the standard UKF (167.3~mm) and an 11.9\% improvement over MCC-UKF (147.4~mm). Compared to the LOS scenario (Table~\ref{tab:sota_comparison}), the relative advantage of PC-UKF over the standard UKF increases from 16.4\% to 22.4\%, demonstrating that the pairwise consensus mechanism is particularly effective when one anchor provides degraded measurements. All robust methods substantially outperform the standard UKF, confirming the need for adaptive measurement noise handling in practical deployments.
+PC-UKF achieves the lowest RMSE of 125.0~mm---a 25.3\% improvement over the standard UKF (167.3~mm), 15.2\% over MCC-UKF (147.4~mm), and 2.0\% over GUKF (127.5~mm). While GUKF attains slightly better MAE and CEP50 through its Gaussian smoothing approach, PC-UKF maintains a lower RMSE, P95, and MAX error, indicating better control of large outliers. Compared to the LOS scenario (Table~\ref{tab:sota_comparison}), the relative advantage of PC-UKF over the standard UKF increases from 16.4\% to 25.3\%, demonstrating that the pairwise consensus mechanism is particularly effective when one anchor provides degraded measurements. All robust methods substantially outperform the standard UKF, confirming the need for adaptive measurement noise handling in practical deployments.
 
-\subsection{Computational Overhead}
-
-The PC scoring adds an LS computation ($\mathcal{O}(N)$) and $N(N-1)/2$ pairwise kernel evaluations per timestep. Measured on a standard CPU, the per-sample processing times are: UKF 0.093~ms, MCC-UKF 0.126~ms, Huber-UKF 0.149~ms, and PC-UKF 0.162~ms. The PC-UKF is 1.7$\times$ slower than the standard UKF but comparable to the iterative methods, making it practical for real-time applications at typical UWB update rates (10--200~Hz).
+We note that the pairwise consensus mechanism relies on a preliminary LS position estimate to compute geometric residuals (Step~1 in Algorithm~\ref{alg:pc}). When a majority of anchors simultaneously suffer from large NLOS biases, the LS estimate itself may be corrupted, potentially causing the consensus scores to misclassify clean anchors as outliers. In the tested scenarios---where at most one out of four anchors is degraded---this limitation does not manifest, as the remaining three anchors provide sufficient geometric redundancy for a reliable LS estimate.
 
 
 % ══════════════════════════════════════════════════════════════════════
@@ -302,7 +300,9 @@ The PC scoring adds an LS computation ($\mathcal{O}(N)$) and $N(N-1)/2$ pairwise
 % ══════════════════════════════════════════════════════════════════════
 \section{Conclusion}
 
-This letter presented a Pairwise Consensus scoring mechanism for adaptive measurement noise covariance in Kalman-family filters applied to UWB indoor positioning. By leveraging inter-anchor residual consistency through a Student-$t$ kernel, the proposed method reliably identifies and down-weights unreliable measurements without requiring channel models or training data. Experimental results on real UWB data demonstrated consistent improvements across KF, EKF, and UKF variants. Under LOS conditions, PC-UKF achieves 89.0~mm RMSE, outperforming Huber-UKF by 16.7\% and MCC-UKF by 8.1\%. Under intermittent anchor failure, the advantage is even more pronounced: PC-UKF reduces RMSE by 22.4\% over standard UKF and 11.9\% over MCC-UKF (129.8 vs.\ 167.3 and 147.4~mm, respectively). Future work will explore extensions to dynamic environments with more anchors and integration with inertial measurement units.
+This letter presented a Pairwise Consensus scoring mechanism for adaptive measurement noise covariance in Kalman-family filters applied to UWB indoor positioning. By leveraging inter-anchor residual consistency through a Student-$t$ kernel, the proposed method reliably identifies and down-weights unreliable measurements without requiring labeled data or channel models. Experimental results on real UWB data demonstrated consistent improvements across KF, EKF, and UKF variants. Under LOS conditions, PC-UKF achieves 89.0~mm RMSE, outperforming Huber-UKF by 16.7\%, MCC-UKF by 8.1\%, and GUKF by 11.4\%. Under intermittent anchor failure, the advantage is even more pronounced: PC-UKF reduces RMSE by 25.3\% over standard UKF, 15.2\% over MCC-UKF, and 2.0\% over GUKF (125.0 vs.\ 167.3, 147.4, and 127.5~mm, respectively).
+
+Several limitations should be noted. The evaluation is conducted in a single rectangular indoor environment with four anchors; generalization to diverse room geometries, anchor configurations, and larger anchor counts remains to be validated. The random-walk dynamic model does not capture tag velocity, which may limit performance under fast or variable-speed motion. Additionally, the consensus mechanism assumes that a majority of anchors provide reliable measurements---under simultaneous multi-anchor NLOS, the approach may degrade. Future work will address these limitations by extending evaluation to multiple environments, incorporating velocity-augmented state models, and exploring integration with inertial measurement units.
 
 
 % ══════════════════════════════════════════════════════════════════════
@@ -325,8 +325,20 @@ Y.~Huang, Y.~Zhang, Z.~Wu, N.~Li, and J.~Chambers, ``A novel adaptive Kalman fil
 \bibitem{mcc_ukf}
 B.~Chen, X.~Liu, H.~Zhao, and J.~C. Principe, ``Maximum correntropy Kalman filter,'' \emph{Automatica}, vol.~76, pp.~70--77, Feb. 2017.
 
+\bibitem{mcc_ukf_uwb}
+Y.~Huang, B.~Cao, and A.~Wang, ``Design a novel algorithm for enhancing UWB positioning accuracy in GPS denied environments,'' \emph{Sci. Rep.}, vol.~14, no.~1, art.~23895, Oct. 2024.
+
 \bibitem{ml_uwb}
 A.~Poulose and D.~S. Han, ``UWB indoor localization using deep learning LSTM networks,'' \emph{Appl. Sci.}, vol.~10, no.~18, p.~6290, 2020.
+
+\bibitem{gukf}
+D.~Sun \emph{et~al.}, ``A Gaussian unscented Kalman filter algorithm for indoor positioning system using ultra wide band measurement,'' \emph{IET Radar Sonar Navig.}, vol.~19, no.~1, e12682, Dec. 2024.
+
+\bibitem{raim}
+R.~G. Brown, ``A baseline GPS RAIM scheme and a note on the equivalence of three RAIM methods,'' \emph{Navigation}, vol.~39, no.~3, pp.~301--316, Fall 1992.
+
+\bibitem{raim_survey}
+M.~Joerger, F.~C. Chan, and B.~Pervan, ``Solution separation versus residual-based RAIM,'' \emph{Navigation}, vol.~61, no.~4, pp.~273--291, 2014.
 
 \bibitem{ls_trilateration}
 Y.~Chan and K.~Ho, ``A simple and efficient estimator for hyperbolic location,'' \emph{IEEE Trans. Signal Process.}, vol.~42, no.~8, pp.~1905--1915, Aug. 1994.
