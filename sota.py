@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-UWB Indoor Positioning — V18: Robust & Adaptive KF
+UWB Indoor Positioning — V19: Robust & Adaptive KF
 ===================================================
 CÁC PHƯƠNG PHÁP:
   1. Raw + LS        — baseline
@@ -53,52 +53,32 @@ GT_SPACING = 5.0
 N_ANCHORS  = 4
 
 # ─── Standard UKF ────────────────────────────────────────────────────
-UKF_STD_Q      = 0.01
-UKF_STD_R      = 300.0
+UKF_STD_Q      = 0.001
+UKF_STD_R      = 50.0
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
 HUBER_Q       = 0.001
-HUBER_R       = 5.0
+HUBER_R       = 50.0
 HUBER_DELTA   = 20.0
 HUBER_MAXITER = 5
 
-# HUBER_Q       = 0.001
-# HUBER_R       = 20.0
-# HUBER_DELTA   = 2.5
-# HUBER_MAXITER = 5
-
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
 MCC_Q          = 0.001
-MCC_R          = 10.0
-MCC_KERNEL_BW  = 1100.0
+MCC_R          = 100.0
+MCC_KERNEL_BW  = 1700.0
 MCC_MAXITER    = 5
-
-# MCC_Q          = 0.001
-# MCC_R          = 100.0
-# MCC_KERNEL_BW  = 1700.0
-# MCC_MAXITER    = 5
 
 # ─── PC-UKF-2D ─────────────────
 PCUKF_Q        = 0.001
-PCUKF_R_BASE   = 10.0
+PCUKF_R_BASE   = 25.0
 PCUKF_R_SCALE  = 15.0
-PCUKF_SIGMA    = 200.0
-
-# PCUKF_Q        = 0.001
-# PCUKF_R_BASE   = 50.0
-# PCUKF_R_SCALE  = 5.0
-# PCUKF_SIGMA    = 1.0
+PCUKF_SIGMA    = 300.0
 
 # ─── GUKF (Gaussian-smoothed UKF) ────────────────────────────────────
 GUKF_Q      = 0.001
-GUKF_R      = 50.0
-GUKF_SIGMA  = 5.0   # σ của Gaussian template (paper dùng σ=1)
-GUKF_N_HALF = 4     # n trong template dài 2n+1=5 (như paper)
-
-# GUKF_Q      = 0.001
-# GUKF_R      = 200.0
-# GUKF_SIGMA  = 5.0   # σ của Gaussian template (paper dùng σ=1)
-# GUKF_N_HALF = 4     # n trong template dài 2n+1=5 (như paper)
+GUKF_R      = 100.0
+GUKF_SIGMA  = 5.0
+GUKF_N_HALF = 4
 
 # ─── UKF common ──────────────────────────────────────────────────────
 UKF_ALPHA = 1e-3
@@ -110,7 +90,7 @@ DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 1.00
+MOTION_RATIO_MIN = 0.00
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -165,7 +145,6 @@ def LS_position(distances, anchors=ANCHORS, weights=None):
 #  MOTION SANITY CHECK
 # ══════════════════════════════════════════════════════════════════════
 def compute_trajectory_displacement(pos_xy):
-    """Tổng khoảng cách di chuyển giữa các bước liên tiếp (mm)."""
     if len(pos_xy) < 2:
         return 0.0
     diffs = np.diff(pos_xy, axis=0)
@@ -314,7 +293,6 @@ class HuberUKF:
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
 
-        # Compute một lần từ x_pred
         z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
             x_pred, P_pred, self.Wm, self.Wc, self.c)
 
@@ -323,7 +301,7 @@ class HuberUKF:
 
         for _ in range(self.maxiter):
             Pzz_eff  = Pzz_no_R + R_eff
-            innov    = z_raw - z_hat          # z_hat cố định từ x_pred — đúng cho IRLS
+            innov    = z_raw - z_hat
             pzz_diag = np.maximum(np.diag(Pzz_eff), 1e-9)
             r_scaled = innov / np.sqrt(pzz_diag)
             hub_w    = np.where(
@@ -334,7 +312,6 @@ class HuberUKF:
             hub_w = np.maximum(hub_w, 1e-4)
             R_eff = np.diag(self.R_base / hub_w)
 
-        # Một lần update cuối với R_eff đã hội tụ
         Pzz_eff = Pzz_no_R + R_eff
         try:
             K = Pxz @ np.linalg.inv(Pzz_eff)
@@ -500,39 +477,25 @@ class PCUKF2D:
 
 # ══════════════════════════════════════════════════════════════════════
 #  6. GUKF — Gaussian Unscented Kalman Filter
-#     Ref: Sun et al., IET Radar Sonar Navig. 2025 (rsn2.12682)
-#
-#  Ý tưởng: dùng Gaussian template h(x) ~ N(0,σ) để làm mượt (smooth)
-#  chuỗi khoảng cách đo được bằng tích chập vòng tròn, sau đó đưa
-#  khoảng cách đã lọc vào UKF thông thường.
-#
-#  Template chiều dài 2n+1, kernel:  h[k] = exp(-k²/(2σ²)) / Z
-#  Tích chập: R'_{i,k} = Σ_{j=-n}^{n}  R_{i,k+j} · h[j]
-#  Vì cần R_{i,k-n..k+n} tại bước k, bộ lọc giữ lại buffer
-#  2n+1 quan sát gần nhất rồi áp dụng kernel tại mỗi bước.
 # ══════════════════════════════════════════════════════════════════════
 def _make_gaussian_kernel(n_half, sigma):
-    """Tạo kernel Gaussian 1D chuẩn hoá, chiều dài 2*n_half+1."""
     idx = np.arange(-n_half, n_half + 1, dtype=float)
     h   = np.exp(-0.5 * idx**2 / (sigma**2 + 1e-12))
     return h / h.sum()
 
 
 class GUKF:
-    """Gaussian-smoothed UKF: làm mượt khoảng cách trước khi vào UKF."""
-
     def __init__(self, q=GUKF_Q, r=GUKF_R,
                  sigma=GUKF_SIGMA, n_half=GUKF_N_HALF):
         self.n      = 2
         self.Q_mat  = np.eye(2) * q
         self.R_mat  = np.eye(N_ANCHORS) * r
-        self.kernel = _make_gaussian_kernel(n_half, sigma)  # shape (2n+1,)
+        self.kernel = _make_gaussian_kernel(n_half, sigma)
         self.n_half = n_half
-        self.win    = 2 * n_half + 1          # cửa sổ buffer
+        self.win    = 2 * n_half + 1
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x    = None
         self.P    = None
-        # Buffer lưu 'win' quan sát gần nhất (mỗi hàng = N_ANCHORS khoảng cách)
         self._buf = []
 
     def init(self, x0):
@@ -541,21 +504,17 @@ class GUKF:
         self._buf = []
 
     def _smooth(self, z_raw):
-        """Trả về khoảng cách đã làm mượt bằng Gaussian convolution."""
         self._buf.append(z_raw.copy())
         if len(self._buf) > self.win:
             self._buf.pop(0)
-
-        buf = np.array(self._buf)              # shape (<=win, N_ANCHORS)
+        buf = np.array(self._buf)
         L   = len(buf)
-
         if L < self.win:
-            # Chưa đủ buffer — dùng L mẫu cuối cùng của kernel và renormalise
-            h_cut = self.kernel[self.win - L:]  # lấy L phần tử cuối
+            h_cut = self.kernel[self.win - L:]
             h_cut = h_cut / h_cut.sum()
-            return h_cut @ buf                 # shape (N_ANCHORS,)
+            return h_cut @ buf
         else:
-            return self.kernel @ buf           # shape (N_ANCHORS,)
+            return self.kernel @ buf
 
     def step(self, z_raw):
         if self.x is None:
@@ -563,7 +522,6 @@ class GUKF:
 
         z_smooth = self._smooth(z_raw)
 
-        # ── UKF standard steps ──────────────────────────────────────
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
 
@@ -648,7 +606,7 @@ COLORS = {
     "Huber-UKF" : '#E91E63',
     "MCC-UKF"   : '#FF9800',
     "PC-UKF-2D" : '#9C27B0',
-    "GUKF"      : '#4CAF50',   # xanh lá
+    "GUKF"      : '#4CAF50',
 }
 
 
@@ -658,6 +616,7 @@ COLORS = {
 def evaluate_files(file_paths, gt_xy, expected_path_length):
     all_errors    = {m: [] for m in METHODS}
     all_pos       = {m: [] for m in METHODS}
+    per_file_rmse = {m: [] for m in METHODS}   # per-file RMSE để tính std
     collapse_warn = {m: [] for m in METHODS}
     timing        = {m: [] for m in METHODS if m != "Raw+LS"}
 
@@ -698,6 +657,7 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
             row  += f" {flag}{rmse:>10.1f}"
             all_errors[name].extend(errs)
             all_pos[name].extend(valid)
+            per_file_rmse[name].append(rmse)           # lưu RMSE từng file
 
         print(row)
 
@@ -726,6 +686,7 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
         {m: np.array(v) for m, v in all_errors.items()},
         {m: np.array(v) for m, v in all_pos.items()},
         collapse_warn,
+        per_file_rmse,
     )
 
 
@@ -759,7 +720,7 @@ def compute_metrics(errors, pos_xy=None, expected_path_length=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GRID SEARCH — với motion penalty
+#  GRID SEARCH
 # ══════════════════════════════════════════════════════════════════════
 COLLAPSE_PENALTY = 1e9
 
@@ -1042,17 +1003,17 @@ def main():
         METHODS["GUKF"]      = (GUKF,         best_gukf)
 
     # ── Evaluate ──────────────────────────────────────────────────────
-    errors, positions, collapse_warn = evaluate_files(
+    errors, positions, collapse_warn, per_file_rmse = evaluate_files(
         eval_files, gt_xy, expected_path_length)
 
     # ── Summary table ─────────────────────────────────────────────────
     metrics = {}
-    print(f"\n{'═' * 85}")
+    print(f"\n{'═' * 105}")
     print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed (motion_ratio < {MOTION_RATIO_MIN:.0%})")
-    print(f"{'═' * 85}")
+    print(f"{'═' * 105}")
     print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
-          f"{'P95':>7s} {'MAX':>7s} {'MotionR':>8s} {'Status'}")
-    print(f"  {'─' * 73}")
+          f"{'P95':>7s} {'MAX':>7s} {'RMSE mean±std':>16s} {'MotionR':>8s} {'Status'}")
+    print(f"  {'─' * 93}")
 
     for label, errs in errors.items():
         if len(errs) == 0:
@@ -1060,12 +1021,25 @@ def main():
         pos_arr = positions.get(label, np.empty((0, 2)))
         m = compute_metrics(errs, pos_arr, expected_path_length)
         metrics[label] = m
+
+        # per-file RMSE mean ± std (sample std, ddof=1)
+        pf_vals = [v for v in per_file_rmse.get(label, []) if not math.isnan(v)]
+        if len(pf_vals) >= 2:
+            pf_mean = np.mean(pf_vals)
+            pf_std  = np.std(pf_vals, ddof=1)
+            std_str = f"{pf_mean:.1f} ± {pf_std:.1f}"
+        elif len(pf_vals) == 1:
+            std_str = f"{pf_vals[0]:.1f} ± N/A"
+        else:
+            std_str = "N/A"
+
         n_col  = len(collapse_warn.get(label, []))
         status = f"⚠ {n_col} file(s) collapsed" if n_col > 0 else "✅ OK"
-        mr_str = f"{m['motion_ratio']:.2f}" if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A"
+        mr_str = (f"{m['motion_ratio']:.2f}"
+                  if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A")
         print(f"  {label:<14s} {m['rmse']:>7.1f} {m['mae']:>7.1f}"
               f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f} {m['max']:>7.1f}"
-              f" {mr_str:>8s}  {status}")
+              f" {std_str:>16s}  {mr_str:>8s}  {status}")
 
     # ── Wilcoxon ──────────────────────────────────────────────────────
     print(f"\n  Wilcoxon tests (two-sided, vs PC-UKF-2D):")

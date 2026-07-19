@@ -116,7 +116,7 @@ At each timestep $k$, given raw ground distances $\mbf{d}_k = [d_{1,k}, \ldots, 
 \begin{equation}\label{eq:kernel}
     c_{ij} = \left(1 + \frac{(r_i - r_j)^2}{\nu \sigma^2}\right)^{-(\nu+1)/2},
 \end{equation}
-where $\sigma$ is a bandwidth parameter controlling sensitivity. We set $\nu = 4$ and $\sigma = 300$~mm throughout. The Student-$t$ kernel is preferred over the Gaussian kernel ($\nu \to \infty$) because its heavier tails provide greater tolerance to moderate residual discrepancies among anchors under normal conditions, while still penalizing large outliers. The choice $\nu = 4$ balances robustness (heavier tails than Gaussian) with sensitivity to genuinely corrupted measurements (lighter tails than the Cauchy kernel, $\nu = 1$).
+where $\sigma$ is a bandwidth parameter controlling sensitivity. We set $\nu = 4$. The Student-$t$ kernel is preferred over the Gaussian kernel ($\nu \to \infty$) because its heavier tails provide greater tolerance to moderate residual discrepancies among anchors under normal conditions, while still penalizing large outliers. The choice $\nu = 4$ balances robustness (heavier tails than Gaussian) with sensitivity to genuinely corrupted measurements (lighter tails than the Cauchy kernel, $\nu = 1$).
 
 \textbf{Step 3 --- Consensus score.} The score for anchor $i$ is the average pairwise agreement:
 \begin{equation}\label{eq:score}
@@ -131,10 +131,10 @@ The consensus scores are mapped to per-anchor measurement noise:
 \begin{equation}\label{eq:adaptive_R}
     R_i = R_{\text{base}} \cdot \left(1 + R_{\text{scale}} \cdot (1 - s_i)\right).
 \end{equation}
-In our experiments, we set $R_{\text{base}} = 50$~mm$^2$ and $R_{\text{scale}} = 5$, selected via cross-validation on a held-out LOS run. This construction ensures:
+This construction ensures:
 \begin{itemize}
     \item \emph{Trusted anchor} ($s_i \to 1$): $R_i \to R_{\text{base}}$ --- the filter fully utilizes the measurement.
-    \item \emph{Outlier anchor} ($s_i \to 0$): $R_i \to R_{\text{base}}(1+R_{\text{scale}}) = 300$~mm$^2$ --- the measurement is heavily discounted.
+    \item \emph{Outlier anchor} ($s_i \to 0$): $R_i \to R_{\text{base}}(1+R_{\text{scale}})$ --- the measurement is heavily discounted.
 \end{itemize}
 
 \subsection{Integration with Kalman Filter Variants}
