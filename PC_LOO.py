@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-UWB Indoor Positioning — V19: Robust & Adaptive KF
+UWB Indoor Positioning — V20: Robust & Adaptive KF
 ===================================================
 CÁC PHƯƠNG PHÁP:
   1. Raw + LS        — baseline
@@ -8,6 +8,7 @@ CÁC PHƯƠNG PHÁP:
   3. Huber-UKF        — IRLS Huber M-estimator
   4. MCC-UKF          — Maximum Correntropy Criterion UKF
   5. PC-UKF-2D        — Pairwise Consensus adaptive R + UKF 2D (tuned)
+  6. GUKF             — Gaussian-smoothed UKF
 
 Format file .txt: timestamp, d0_slant, d1_slant, d2_slant, d3_slant, v_mm_s, gz_dps
 """
@@ -53,8 +54,8 @@ GT_SPACING = 5.0
 N_ANCHORS  = 4
 
 # ─── Standard UKF ────────────────────────────────────────────────────
-UKF_STD_Q      = 0.001
-UKF_STD_R      = 50.0
+UKF_STD_Q = 0.001
+UKF_STD_R = 50.0
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
 HUBER_Q       = 0.001
@@ -63,16 +64,16 @@ HUBER_DELTA   = 20.0
 HUBER_MAXITER = 5
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
-MCC_Q          = 0.001
-MCC_R          = 100.0
-MCC_KERNEL_BW  = 1700.0
-MCC_MAXITER    = 5
+MCC_Q         = 0.001
+MCC_R         = 100.0
+MCC_KERNEL_BW = 1700.0
+MCC_MAXITER   = 5
 
-# ─── PC-UKF-2D ─────────────────
-PCUKF_Q        = 0.001
-PCUKF_R_BASE   = 25.0
-PCUKF_R_SCALE  = 15.0
-PCUKF_SIGMA    = 300.0
+# ─── PC-UKF-2D ───────────────────────────────────────────────────────
+PCUKF_Q      = 0.001
+PCUKF_R_BASE = 25.0
+PCUKF_R_SCALE = 15.0
+PCUKF_SIGMA  = 300.0
 
 # ─── GUKF (Gaussian-smoothed UKF) ────────────────────────────────────
 GUKF_Q      = 0.001
@@ -85,12 +86,24 @@ UKF_ALPHA = 1e-3
 UKF_BETA  = 2.0
 UKF_KAPPA = 0.0
 
-DO_GRID_SEARCH = True
+# ─── Grid search flags ───────────────────────────────────────────────
+# Bật/tắt grid search trong nhánh fallback (chỉ có 1 file)
+DO_GRID_SEARCH     = False
+# Bật/tắt grid search trong LOO (≥ 2 file).
+# Khi False → dùng default params, không mất thời gian tune.
+DO_LOO_GRID_SEARCH = True
+
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_LOO"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 0.00
+MOTION_RATIO_MIN = 1.00
+
+# ─── Shared fixed params cho grid search — fair comparison ───────────
+FIXED_Q = 0.001   # process noise — tất cả method dùng chung
+FIXED_R = 50.0    # base measurement noise — tất cả method dùng chung
+
+COLLAPSE_PENALTY = 1e9
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -158,8 +171,8 @@ def is_trajectory_collapsed(pos_xy, expected_path_length,
     total_disp = compute_trajectory_displacement(pos_xy)
     if total_disp < ratio_min * expected_path_length:
         return True
-    bbox_x = pos_xy[:, 0].max() - pos_xy[:, 0].min()
-    bbox_y = pos_xy[:, 1].max() - pos_xy[:, 1].min()
+    bbox_x    = pos_xy[:, 0].max() - pos_xy[:, 0].min()
+    bbox_y    = pos_xy[:, 1].max() - pos_xy[:, 1].min()
     bbox_diag = math.sqrt(bbox_x**2 + bbox_y**2)
     if bbox_diag < 0.05 * expected_path_length:
         return True
@@ -361,10 +374,10 @@ class MCCUKF:
         R_eff = np.eye(N_ANCHORS) * self.R_base
 
         for _ in range(self.maxiter):
-            innov  = z_raw - z_hat
-            kern_w = self._gaussian_kernel(innov)
-            kern_w = np.maximum(kern_w, 1e-4)
-            R_eff  = np.diag(self.R_base / kern_w)
+            innov   = z_raw - z_hat
+            kern_w  = self._gaussian_kernel(innov)
+            kern_w  = np.maximum(kern_w, 1e-4)
+            R_eff   = np.diag(self.R_base / kern_w)
             Pzz_eff = Pzz_no_R + R_eff
             try:
                 K = Pxz @ np.linalg.inv(Pzz_eff)
@@ -393,11 +406,11 @@ class _KF1D_for_PC:
         if self.x is None:
             self.x = z
             return 0.0
-        P_pred     = self.P + self.Q
-        innov      = z - self.x
-        K          = P_pred / (P_pred + self.R)
-        self.x    += K * innov
-        self.P     = (1 - K) * P_pred
+        P_pred  = self.P + self.Q
+        innov   = z - self.x
+        K       = P_pred / (P_pred + self.R)
+        self.x += K * innov
+        self.P  = (1 - K) * P_pred
         return innov
 
 
@@ -415,15 +428,16 @@ def pc_consensus_scores(innovations, sigma=PCUKF_SIGMA, d_raw=None):
         residual = np.abs(innovations)
 
     scores = np.zeros(N_ANCHORS)
-    eps = 1e-9
+    eps    = 1e-9
     for i in range(N_ANCHORS):
         s = 0.0; cnt = 0
         for j in range(N_ANCHORS):
-            if i == j: continue
+            if i == j:
+                continue
             diff = residual[i] - residual[j]
-            nu = 4.0
-            c = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu+1.0)/2.0)
-            s += c; cnt += 1
+            nu   = 4.0
+            c    = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu+1.0)/2.0)
+            s   += c; cnt += 1
         scores[i] = s / cnt
     return scores
 
@@ -449,9 +463,10 @@ class PCUKF2D:
         if self.x is None:
             return np.full(2, np.nan)
 
-        innovations = np.array([self._kfs[i].update(z_raw[i]) for i in range(N_ANCHORS)])
-        scores = pc_consensus_scores(innovations, self.sigma, d_raw=z_raw)
-        R_diag      = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
+        innovations = np.array([self._kfs[i].update(z_raw[i])
+                                 for i in range(N_ANCHORS)])
+        scores  = pc_consensus_scores(innovations, self.sigma, d_raw=z_raw)
+        R_diag  = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
 
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
@@ -459,7 +474,7 @@ class PCUKF2D:
         z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
             x_pred, P_pred, self.Wm, self.Wc, self.c)
 
-        R      = np.diag(R_diag)
+        R       = np.diag(R_diag)
         Pzz_eff = Pzz_no_R + R
 
         try:
@@ -499,8 +514,8 @@ class GUKF:
         self._buf = []
 
     def init(self, x0):
-        self.x   = x0.astype(float).copy()
-        self.P   = np.eye(self.n) * 1e6
+        self.x    = x0.astype(float).copy()
+        self.P    = np.eye(self.n) * 1e6
         self._buf = []
 
     def _smooth(self, z_raw):
@@ -558,6 +573,30 @@ def run_filter(filt_class, dist_raw, **kwargs):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  METHODS TABLE
+# ══════════════════════════════════════════════════════════════════════
+METHODS = {
+    "Raw+LS"    : None,
+    "UKF"       : (StandardUKF, dict(q=UKF_STD_Q,  r=UKF_STD_R)),
+    "Huber-UKF" : (HuberUKF,   dict(q=HUBER_Q,     r=HUBER_R,    delta=HUBER_DELTA)),
+    "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
+    "PC-UKF-2D" : (PCUKF2D,    dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
+                                     r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)),
+    "GUKF"      : (GUKF,        dict(q=GUKF_Q,      r=GUKF_R,
+                                     sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)),
+}
+
+COLORS = {
+    "Raw+LS"    : '#9E9E9E',
+    "UKF"       : '#00BCD4',
+    "Huber-UKF" : '#E91E63',
+    "MCC-UKF"   : '#FF9800',
+    "PC-UKF-2D" : '#9C27B0',
+    "GUKF"      : '#4CAF50',
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  PARSE FILE
 # ══════════════════════════════════════════════════════════════════════
 def parse_file(path):
@@ -587,36 +626,12 @@ def safe_len(path):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  METHODS TABLE
-# ══════════════════════════════════════════════════════════════════════
-METHODS = {
-    "Raw+LS"   : None,
-    "UKF"       : (StandardUKF, dict(q=UKF_STD_Q,  r=UKF_STD_R)),
-    "Huber-UKF" : (HuberUKF,   dict(q=HUBER_Q,     r=HUBER_R,    delta=HUBER_DELTA)),
-    "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
-    "PC-UKF-2D" : (PCUKF2D,    dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
-                                     r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)),
-    "GUKF"      : (GUKF,        dict(q=GUKF_Q,      r=GUKF_R,
-                                     sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)),
-}
-
-COLORS = {
-    "Raw+LS"   : '#9E9E9E',
-    "UKF"       : '#00BCD4',
-    "Huber-UKF" : '#E91E63',
-    "MCC-UKF"   : '#FF9800',
-    "PC-UKF-2D" : '#9C27B0',
-    "GUKF"      : '#4CAF50',
-}
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  EVALUATE
+#  EVALUATE (fallback — không LOO)
 # ══════════════════════════════════════════════════════════════════════
 def evaluate_files(file_paths, gt_xy, expected_path_length):
     all_errors    = {m: [] for m in METHODS}
     all_pos       = {m: [] for m in METHODS}
-    per_file_rmse = {m: [] for m in METHODS}   # per-file RMSE để tính std
+    per_file_rmse = {m: [] for m in METHODS}
     collapse_warn = {m: [] for m in METHODS}
     timing        = {m: [] for m in METHODS if m != "Raw+LS"}
 
@@ -645,19 +660,18 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
                 pos = run_filter(filt_cls, dist_raw, **kwargs)
                 timing[name].append(time.perf_counter() - t0)
 
-            valid = pos[~np.any(np.isnan(pos), axis=1)]
-
+            valid     = pos[~np.any(np.isnan(pos), axis=1)]
             collapsed = is_trajectory_collapsed(valid, expected_path_length)
             if collapsed:
                 collapse_warn[name].append(os.path.basename(path))
 
-            errs  = nearest_gt_error(valid, gt_xy)
-            rmse  = np.sqrt(np.mean(errs**2)) if len(errs) > 0 else float('nan')
-            flag  = "⚠" if collapsed else " "
-            row  += f" {flag}{rmse:>10.1f}"
+            errs = nearest_gt_error(valid, gt_xy)
+            rmse = np.sqrt(np.mean(errs**2)) if len(errs) > 0 else float('nan')
+            flag = "⚠" if collapsed else " "
+            row += f" {flag}{rmse:>10.1f}"
             all_errors[name].extend(errs)
             all_pos[name].extend(valid)
-            per_file_rmse[name].append(rmse)           # lưu RMSE từng file
+            per_file_rmse[name].append(rmse)
 
         print(row)
 
@@ -677,7 +691,8 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
     for name, files in collapse_warn.items():
         if files:
             any_warn = True
-            print(f"    ⚠  {name:<14s}: {len(files)} file(s) → {', '.join(files[:5])}"
+            print(f"    ⚠  {name:<14s}: {len(files)} file(s) → "
+                  f"{', '.join(files[:5])}"
                   + (" ..." if len(files) > 5 else ""))
     if not any_warn:
         print("    ✅ Không có trajectory nào bị collapse.")
@@ -691,13 +706,10 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
 
 def compute_metrics(errors, pos_xy=None, expected_path_length=None):
-    base = {}
     if len(errors) == 0:
-        base = {k: float('nan') for k in
+        return {k: float('nan') for k in
                 ['mae', 'rmse', 'cep50', 'cep90', 'p95', 'max',
                  'motion_ratio', 'collapsed']}
-        return base
-
     base = {
         'mae'  : float(np.mean(errors)),
         'rmse' : float(np.sqrt(np.mean(errors**2))),
@@ -706,7 +718,6 @@ def compute_metrics(errors, pos_xy=None, expected_path_length=None):
         'p95'  : float(np.percentile(errors, 95)),
         'max'  : float(np.max(errors)),
     }
-
     if pos_xy is not None and expected_path_length is not None and len(pos_xy) > 1:
         disp  = compute_trajectory_displacement(pos_xy)
         ratio = disp / (expected_path_length + 1e-9)
@@ -715,28 +726,24 @@ def compute_metrics(errors, pos_xy=None, expected_path_length=None):
     else:
         base['motion_ratio'] = float('nan')
         base['collapsed']    = False
-
     return base
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  GRID SEARCH
 # ══════════════════════════════════════════════════════════════════════
-COLLAPSE_PENALTY = 1e9
-
-
 def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
                       expected_path_length):
-    pos_all      = []
-    n_collapsed  = 0
-    n_files      = 0
+    pos_all     = []
+    n_collapsed = 0
+    n_files     = 0
 
     for path in file_paths:
         d = parse_file(path)
         if d is None:
             continue
         n_files += 1
-        p = run_filter(filt_class, d, **kwargs)
+        p     = run_filter(filt_class, d, **kwargs)
         valid = p[~np.any(np.isnan(p), axis=1)]
 
         if is_trajectory_collapsed(valid, expected_path_length):
@@ -757,89 +764,94 @@ def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
     errs = nearest_gt_error(np.array(pos_all), gt_xy)
     rmse = float(np.sqrt(np.mean(errs**2)))
     rmse += n_collapsed * 500.0
-
     return rmse
 
 
-# ── Shared fixed params — fair comparison ─────────────────────────────
-FIXED_Q = 0.001   # process noise — tất cả method dùng chung
-FIXED_R = 50.0    # base measurement noise — tất cả method dùng chung
-
-
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
-    """Tune duy nhất delta — tham số đặc thù của Huber."""
-    deltas = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0, 10.0, 20.0, 50.0]
-    print(f"\n  Grid search Huber-UKF: {len(deltas)} combinations "
+    """
+    Tune duy nhất delta — tham số đặc thù của Huber.
+    10 điểm log-spaced trên [0.1, 100].
+    """
+    deltas = np.logspace(-1, 2, 10).tolist()   # ~0.1, 0.22, 0.46 … 100
+    print(f"\n  Grid search Huber-UKF: {len(deltas)} points "
           f"[q={FIXED_Q}, r={FIXED_R} fixed]")
     best_rmse = float('inf')
-    best = dict(q=FIXED_Q, r=FIXED_R, delta=HUBER_DELTA)
+    best      = dict(q=FIXED_Q, r=FIXED_R, delta=HUBER_DELTA)
     for delta in deltas:
         params = dict(q=FIXED_Q, r=FIXED_R, delta=delta)
-        rmse = _eval_rmse_single(HuberUKF, params, file_paths, gt_xy,
-                                  expected_path_length)
+        rmse   = _eval_rmse_single(HuberUKF, params, file_paths, gt_xy,
+                                    expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
-            best = params.copy()
+            best      = params.copy()
     tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
     print(f"  Best Huber-UKF: RMSE={best_rmse:.1f}mm{tag} | "
-          f"delta={best['delta']}")
+          f"delta={best['delta']:.3f}")
     return best
 
 
 def grid_search_mcc(file_paths, gt_xy, expected_path_length):
-    """Tune duy nhất kernel_bw — tham số đặc thù của MCC."""
-    bws = [100.0, 300.0, 500.0, 800.0, 1100.0,
-           1300.0, 1500.0, 1700.0, 2000.0, 3000.0]
-    print(f"\n  Grid search MCC-UKF: {len(bws)} combinations "
+    """
+    Tune duy nhất kernel_bw — tham số đặc thù của MCC.
+    10 điểm log-spaced trên [100, 5000].
+    """
+    bws = np.logspace(2, np.log10(5000), 10).tolist()
+    print(f"\n  Grid search MCC-UKF: {len(bws)} points "
           f"[q={FIXED_Q}, r={FIXED_R} fixed]")
     best_rmse = float('inf')
-    best = dict(q=FIXED_Q, r=FIXED_R, kernel_bw=MCC_KERNEL_BW)
+    best      = dict(q=FIXED_Q, r=FIXED_R, kernel_bw=MCC_KERNEL_BW)
     for bw in bws:
         params = dict(q=FIXED_Q, r=FIXED_R, kernel_bw=bw)
-        rmse = _eval_rmse_single(MCCUKF, params, file_paths, gt_xy,
-                                  expected_path_length)
+        rmse   = _eval_rmse_single(MCCUKF, params, file_paths, gt_xy,
+                                    expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
-            best = params.copy()
+            best      = params.copy()
     tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
     print(f"  Best MCC-UKF: RMSE={best_rmse:.1f}mm{tag} | "
-          f"kernel_bw={best['kernel_bw']}")
+          f"kernel_bw={best['kernel_bw']:.1f}")
     return best
 
 
 def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
-    """Tune r_scale va sigma — tham số đặc thù của PC.
-    r_base = FIXED_R để so sánh fair với các method khác."""
+    """
+    Tune r_scale và sigma — tham số đặc thù của PC.
+    r_base = FIXED_R để so sánh fair.
+    8×8 = 64 combinations, cả hai trục log-spaced.
+    """
     grid = {
-        'r_scale': [1.0, 3.0, 5.0, 8.0, 10.0, 15.0, 20.0, 30.0, 50.0],
-        'sigma'  : [50.0, 100.0, 200.0, 300.0, 500.0, 800.0],
+        'r_scale': np.logspace(0, 2, 8).tolist(),          # 1 → 100
+        'sigma'  : np.logspace(np.log10(50), 3, 8).tolist(), # 50 → 1000
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
     print(f"\n  Grid search PC-UKF-2D: {len(combos)} combinations "
           f"[q={FIXED_Q}, r_base={FIXED_R} fixed]")
     best_rmse = float('inf')
-    best = dict(q=FIXED_Q, r_base=FIXED_R,
-                r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)
+    best      = dict(q=FIXED_Q, r_base=FIXED_R,
+                     r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)
     for combo in combos:
-        params = dict(zip(keys, combo))
+        params           = dict(zip(keys, combo))
         params['q']      = FIXED_Q
         params['r_base'] = FIXED_R
         rmse = _eval_rmse_single(PCUKF2D, params, file_paths, gt_xy,
                                   expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
-            best = params.copy()
+            best      = params.copy()
     tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
     print(f"  Best PC-UKF-2D: RMSE={best_rmse:.1f}mm{tag} | "
-          f"r_scale={best['r_scale']} sigma={best['sigma']}")
+          f"r_scale={best['r_scale']:.3f} sigma={best['sigma']:.1f}")
     return best
 
 
 def grid_search_gukf(file_paths, gt_xy, expected_path_length):
-    """Tune sigma va n_half — tham số đặc thù của Gaussian kernel."""
+    """
+    Tune sigma và n_half — tham số đặc thù của Gaussian kernel.
+    8×8 = 64 combinations; sigma log-spaced [0.3, 20], n_half linear.
+    """
     grid = {
-        'sigma'  : [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0],
+        'sigma'  : np.logspace(np.log10(0.3), np.log10(20), 8).tolist(),
         'n_half' : [1, 2, 3, 4, 5, 6, 8, 10],
     }
     keys   = list(grid.keys())
@@ -847,21 +859,31 @@ def grid_search_gukf(file_paths, gt_xy, expected_path_length):
     print(f"\n  Grid search GUKF: {len(combos)} combinations "
           f"[q={FIXED_Q}, r={FIXED_R} fixed]")
     best_rmse = float('inf')
-    best = dict(q=FIXED_Q, r=FIXED_R,
-                sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)
+    best      = dict(q=FIXED_Q, r=FIXED_R,
+                     sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)
     for combo in combos:
-        params = dict(zip(keys, combo))
-        params['q'] = FIXED_Q
-        params['r'] = FIXED_R
+        params        = dict(zip(keys, combo))
+        params['q']   = FIXED_Q
+        params['r']   = FIXED_R
         rmse = _eval_rmse_single(GUKF, params, file_paths, gt_xy,
                                   expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
-            best = params.copy()
+            best      = params.copy()
     tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
     print(f"  Best GUKF: RMSE={best_rmse:.1f}mm{tag} | "
-          f"sigma={best['sigma']} n_half={best['n_half']}")
+          f"sigma={best['sigma']:.3f} n_half={best['n_half']}")
     return best
+
+
+def _default_params():
+    """Trả về params mặc định khi không chạy grid search."""
+    return (
+        dict(q=FIXED_Q, r=FIXED_R, delta=HUBER_DELTA),
+        dict(q=FIXED_Q, r=FIXED_R, kernel_bw=MCC_KERNEL_BW),
+        dict(q=FIXED_Q, r_base=FIXED_R, r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA),
+        dict(q=FIXED_Q, r=FIXED_R, sigma=GUKF_SIGMA, n_half=GUKF_N_HALF),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -876,15 +898,15 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
         cdf  = np.arange(1, len(s) + 1) / len(s)
         rmse = np.sqrt(np.mean(errors**2))
         c    = COLORS.get(label, 'gray')
-        lw   = 2.5 if label not in ("Raw+LS",) else 1.5
-        ls   = '-'  if label not in ("Raw+LS",) else '--'
-        n_col = len(collapse_warn.get(label, []))
+        lw   = 2.5 if label != "Raw+LS" else 1.5
+        ls   = '-'  if label != "Raw+LS" else '--'
+        n_col    = len(collapse_warn.get(label, []))
         warn_tag = f" ⚠{n_col}" if n_col > 0 else ""
         ax.plot(s, cdf, lw=lw, color=c, ls=ls,
                 label=f"{label}{warn_tag}  RMSE={rmse:.1f}mm")
         ax.axvline(rmse, color=c, ls=':', lw=0.8, alpha=0.4)
     ax.set_xlabel("Position Error (mm)", fontsize=13, fontweight='bold')
-    ax.set_ylabel("CDF", fontsize=13, fontweight='bold')
+    ax.set_ylabel("CDF",                 fontsize=13, fontweight='bold')
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
     ax.set_xlim(0, 500)
     ax.set_ylim(0, 1.02)
@@ -898,19 +920,19 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
 
 def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     fig, ax = plt.subplots(figsize=(12, 14))
-
-    ax.plot(gt_xy[:, 0], gt_xy[:, 1], 'k--', lw=2.5, label='Ground Truth', alpha=0.5, zorder=5)
+    ax.plot(gt_xy[:, 0], gt_xy[:, 1],
+            'k--', lw=2.5, label='Ground Truth', alpha=0.5, zorder=5)
 
     for label, pos in positions_dict.items():
         color = COLORS.get(label, 'gray')
         if len(pos) == 0:
             continue
-        errs = nearest_gt_error(pos, gt_xy)
-        rmse = np.sqrt(np.mean(errs**2))
+        errs  = nearest_gt_error(pos, gt_xy)
+        rmse  = np.sqrt(np.mean(errs**2))
         n_col = len(collapse_warn.get(label, []))
-        warn = f" ⚠{n_col}" if n_col > 0 else ""
-        lw = 2.0 if label != "Raw+LS" else 1.2
-        ls = '-'  if label != "Raw+LS" else '--'
+        warn  = f" ⚠{n_col}" if n_col > 0 else ""
+        lw    = 2.0 if label != "Raw+LS" else 1.2
+        ls    = '-'  if label != "Raw+LS" else '--'
         ax.plot(pos[:, 0], pos[:, 1],
                 color=color, lw=lw, ls=ls, alpha=0.75,
                 label=f"{label}{warn}  RMSE={rmse:.1f}mm")
@@ -930,7 +952,6 @@ def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     ax.legend(fontsize=8, loc='best')
     ax.set_aspect('equal')
     ax.grid(True, ls='--', alpha=0.3)
-
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Trajectories → {save_path}")
@@ -945,9 +966,10 @@ def plot_bar(metrics_dict, save_path):
     for ax, mname, mlabel in zip(axes, metric_names, labels_disp):
         vals    = [metrics_dict[m][mname] for m in methods]
         colors  = [COLORS.get(m, 'gray') for m in methods]
-        hatches = ['//' if metrics_dict[m].get('collapsed', False) else '' for m in methods]
-        bars    = ax.bar(range(len(methods)), vals, color=colors,
-                         alpha=0.85, edgecolor='white', lw=1.5, hatch=None)
+        hatches = ['//' if metrics_dict[m].get('collapsed', False) else ''
+                   for m in methods]
+        bars = ax.bar(range(len(methods)), vals, color=colors,
+                      alpha=0.85, edgecolor='white', lw=1.5)
         for bar, val, hatch, m in zip(bars, vals, hatches, methods):
             if hatch:
                 bar.set_hatch(hatch)
@@ -974,21 +996,23 @@ def plot_bar(metrics_dict, save_path):
 def loo_tune_and_eval(all_files, gt_xy, expected_path_length):
     """
     Leave-One-Out cross-validation:
-      - Với mỗi fold i: tune trên (n-1) file, test trên file i
+      - Với mỗi fold i: (optionally) tune trên (n-1) file, test trên file i
       - Raw+LS, UKF: params cố định, không tune
-      - Huber, MCC, PC, GUKF: tune riêng mỗi fold
+      - Huber, MCC, PC, GUKF: tune khi DO_LOO_GRID_SEARCH=True,
+                               ngược lại dùng default params
 
     Trả về errors aggregate trên toàn bộ dataset (unbiased).
     """
     n = len(all_files)
+    gs_label = "with grid search" if DO_LOO_GRID_SEARCH else "default params (grid search OFF)"
     print(f"\n{'═'*70}")
-    print(f"  LEAVE-ONE-OUT CV — {n} folds")
+    print(f"  LEAVE-ONE-OUT CV — {n} folds  [{gs_label}]")
     print(f"{'═'*70}")
 
     loo_errors    = {m: [] for m in METHODS}
     loo_pos       = {m: [] for m in METHODS}
     per_file_rmse = {m: [] for m in METHODS}
-    fold_params   = []   # log params từng fold để verify
+    fold_params   = []
 
     hdr = f"  {'File':<20s}"
     for m in METHODS:
@@ -1000,11 +1024,14 @@ def loo_tune_and_eval(all_files, gt_xy, expected_path_length):
         tune_files = [f for j, f in enumerate(all_files) if j != i]
         fname      = os.path.basename(test_file)
 
-        # ── Tune adaptive methods trên (n-1) file ──────────────────────
-        best_huber = grid_search_huber(tune_files, gt_xy, expected_path_length)
-        best_mcc   = grid_search_mcc  (tune_files, gt_xy, expected_path_length)
-        best_pc    = grid_search_pcukf(tune_files, gt_xy, expected_path_length)
-        best_gukf  = grid_search_gukf (tune_files, gt_xy, expected_path_length)
+        # ── Tune (hoặc dùng default) ───────────────────────────────────
+        if DO_LOO_GRID_SEARCH:
+            best_huber = grid_search_huber(tune_files, gt_xy, expected_path_length)
+            best_mcc   = grid_search_mcc  (tune_files, gt_xy, expected_path_length)
+            best_pc    = grid_search_pcukf(tune_files, gt_xy, expected_path_length)
+            best_gukf  = grid_search_gukf (tune_files, gt_xy, expected_path_length)
+        else:
+            best_huber, best_mcc, best_pc, best_gukf = _default_params()
 
         fold_params.append({
             'fold': i, 'test': fname,
@@ -1049,18 +1076,18 @@ def loo_tune_and_eval(all_files, gt_xy, expected_path_length):
 
         print(row)
 
-    # ── In bảng params theo fold để verify LOO ─────────────────────────
+    # ── In bảng params per fold ────────────────────────────────────────
     print(f"\n{'─'*70}")
-    print("  PC-UKF params per fold (verify LOO không overfit):")
+    print("  PC-UKF params per fold (verify LOO):")
     print(f"  {'Fold':<6s} {'Test file':<20s} "
           f"{'R_base':>8s} {'R_scale':>8s} {'sigma':>8s}")
     print(f"  {'─'*55}")
     for p in fold_params:
         pc = p['pc']
         print(f"  {p['fold']+1:<6d} {p['test']:<20s} "
-              f"{pc.get('r_base',0):>8.1f} "
-              f"{pc.get('r_scale',0):>8.1f} "
-              f"{pc.get('sigma',0):>8.1f}")
+              f"{pc.get('r_base', FIXED_R):>8.1f} "
+              f"{pc.get('r_scale', PCUKF_R_SCALE):>8.3f} "
+              f"{pc.get('sigma', PCUKF_SIGMA):>8.1f}")
 
     return (
         {m: np.array(v) for m, v in loo_errors.items()},
@@ -1119,7 +1146,7 @@ def print_summary(errors, positions, per_file_rmse,
         if N > 20:
             try:
                 _, p = wilcoxon(errs[:N], ref_err[:N])
-                sym = '✅ p<0.05' if p < 0.05 else '⚠️  ns'
+                sym  = '✅ p<0.05' if p < 0.05 else '⚠️  ns'
                 print(f"    {name:<14s} vs PC-UKF-2D: p={p:.4f}  {sym}")
             except ValueError:
                 pass
@@ -1140,6 +1167,8 @@ def main():
     print("  4. MCC-UKF      — Maximum Correntropy Criterion UKF")
     print("  5. PC-UKF-2D    — Pairwise Consensus UKF (proposed)")
     print("  6. GUKF         — Gaussian-smoothed UKF")
+    print(f"  DO_GRID_SEARCH     = {DO_GRID_SEARCH}")
+    print(f"  DO_LOO_GRID_SEARCH = {DO_LOO_GRID_SEARCH}")
     print("=" * 70)
 
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -1160,7 +1189,7 @@ def main():
           f"Time={total_time:.1f}s  GT={len(gt_xy)} points")
 
     if n >= 2:
-        # ── LOO: tune trên n-1 file, test trên 1 file ──────────────────
+        # ── LOO ─────────────────────────────────────────────────────────
         mode_label = f"LOO-CV ({n} folds)"
         errors, positions, per_file_rmse = loo_tune_and_eval(
             all_files, gt_xy, expected_path_length)
@@ -1173,17 +1202,20 @@ def main():
                 collapse_warn[name].append("aggregate")
 
     else:
-        # ── Fallback khi chỉ có 1 file (ví dụ NLOS chưa đủ mẫu) ───────
+        # ── Fallback: chỉ có 1 file ──────────────────────────────────────
         mode_label = "Grid Search (1 file — chưa đủ mẫu cho LOO)"
         print(f"\n[!] Chỉ có {n} file — LOO cần ≥ 2 file.")
-        print("    → Dùng grid search, thu thêm mẫu để chạy LOO.")
+        print("    → Dùng grid search nếu DO_GRID_SEARCH=True, "
+              "thu thêm mẫu để chạy LOO.")
 
         if DO_GRID_SEARCH:
             print("\n  [Grid Search] Tuning...")
-            best_huber = grid_search_huber(all_files, gt_xy, expected_path_length)
-            best_mcc   = grid_search_mcc  (all_files, gt_xy, expected_path_length)
-            best_pc    = grid_search_pcukf(all_files, gt_xy, expected_path_length)
-            best_gukf  = grid_search_gukf (all_files, gt_xy, expected_path_length)
+            best_huber, best_mcc, best_pc, best_gukf = (
+                grid_search_huber(all_files, gt_xy, expected_path_length),
+                grid_search_mcc  (all_files, gt_xy, expected_path_length),
+                grid_search_pcukf(all_files, gt_xy, expected_path_length),
+                grid_search_gukf (all_files, gt_xy, expected_path_length),
+            )
             METHODS["Huber-UKF"] = (HuberUKF, best_huber)
             METHODS["MCC-UKF"]   = (MCCUKF,   best_mcc)
             METHODS["PC-UKF-2D"] = (PCUKF2D,  best_pc)
@@ -1212,9 +1244,12 @@ def main():
 
     print(f"\n[✓] Kết quả lưu tại '{SAVE_DIR}/'")
     if n >= 2:
+        gs_info = ("với grid search per fold"
+                   if DO_LOO_GRID_SEARCH
+                   else "với default params (DO_LOO_GRID_SEARCH=False)")
         print(f"\n  → Paper claim:")
         print(f"    'Hyperparameters were selected via leave-one-out")
-        print(f"     cross-validation on {n} independent runs.'")
+        print(f"     cross-validation on {n} independent runs ({gs_info}).'")
     else:
         print(f"\n  → Thu thêm mẫu NLOS để chạy LOO.")
 
