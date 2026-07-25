@@ -701,30 +701,29 @@ def _loo_fold_rmse(filt_class, kwargs, val_file, gt_xy, expected_path_length):
 
 
 def _grid_search_loo(filt_class, grid, fixed_params,
-                     file_paths, gt_xy, expected_path_length,
+                     tune_files, gt_xy, expected_path_length,
                      method_name):
     """
-    LOO grid search chung cho mọi filter.
+    LOO grid search — chỉ dùng tập tune_files (N-1 files) để tìm best params.
 
     Protocol:
       - Với mỗi combo (p1, p2, ...):
-          LOO-RMSE = mean( _loo_fold_rmse(val_file_k) for k in 1..N )
+          LOO-RMSE = mean( _loo_fold_rmse(val_file_k) for k in tune_files )
       - Khi tìm được best mới → in ngay: RMSE + tất cả hệ số
       - Trả về (best_params, best_loo_rmse)
 
-    Lý do dùng LOO:
-      - Không có fitting step → LOO đơn giản là unbiased estimate của
-        generalization error: params không "thấy" file đang được validate.
-      - Đảm bảo so sánh công bằng giữa các filter.
+    Lý do dùng LOO trên tune_files:
+      - test_file (file bị loại ra) KHÔNG ĐƯỢC xuất hiện ở bước này,
+        đảm bảo không có data leakage.
     """
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
-    n      = len(file_paths)
+    n      = len(tune_files)
 
-    print(f"\n  LOO Grid search [{method_name}]: "
-          f"{len(combos)} combos × {n} folds = {len(combos) * n} runs")
-    print(f"  {'LOO-RMSE':>10s}  Params")
-    print(f"  {'─' * 55}")
+    print(f"\n    LOO Grid search [{method_name}]: "
+          f"{len(combos)} combos × {n} tune-folds = {len(combos) * n} runs")
+    print(f"    {'LOO-RMSE':>10s}  Params")
+    print(f"    {'─' * 53}")
 
     best_loo_rmse = float('inf')
     best_params   = {**fixed_params}
@@ -733,7 +732,7 @@ def _grid_search_loo(filt_class, grid, fixed_params,
         params = {**fixed_params, **dict(zip(keys, combo))}
 
         fold_rmses = []
-        for val_file in file_paths:
+        for val_file in tune_files:
             fr = _loo_fold_rmse(filt_class, params, val_file,
                                 gt_xy, expected_path_length)
             if fr is not None:
@@ -750,11 +749,11 @@ def _grid_search_loo(filt_class, grid, fixed_params,
             # ── In ngay khi có best mới ─────────────────────────────
             tag       = " ⚠COLLAPSED" if loo_rmse >= COLLAPSE_PENALTY / 1000 else ""
             param_str = "  ".join(f"{k}={params[k]}" for k in keys)
-            print(f"  ★ {loo_rmse:8.2f}mm{tag:<12s}  {param_str}")
+            print(f"    ★ {loo_rmse:8.2f}mm{tag:<12s}  {param_str}")
 
-    print(f"  {'─' * 55}")
+    print(f"    {'─' * 53}")
     best_param_str = "  ".join(f"{k}={best_params[k]}" for k in keys)
-    print(f"  ✔ Best: {best_loo_rmse:.2f}mm  |  {best_param_str}")
+    print(f"    ✔ Best: {best_loo_rmse:.2f}mm  |  {best_param_str}")
     return best_params, best_loo_rmse
 
 
@@ -905,74 +904,89 @@ def plot_bar(metrics_dict, save_path):
 # ══════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 75)
-    print("  V21: Robust & Adaptive UKF — Full LOO Tuning (All Methods)")
+    print("  V22: Robust & Adaptive UKF — LOO Tuning + Full Evaluation")
     print("=" * 75)
     print("  1. Raw+LS      — Weighted Least Squares (baseline)")
-    print("  2. UKF          — Unscented Kalman Filter chuẩn")
-    print("  3. Huber-UKF    — IRLS với Huber M-estimator")
+    print("  2. UKF          — Unscented Kalman Filter chuan")
+    print("  3. Huber-UKF    — IRLS voi Huber M-estimator")
     print("  4. MCC-UKF      — Maximum Correntropy Criterion UKF")
     print("  5. PC-UKF-2D    — MAD sigma-free consensus (LOO-tuned)")
     print("  6. GUKF         — Gaussian-smoothed UKF (Sun et al. 2025)")
     print("=" * 75)
-    print(f"\n  Tuning policy (V21 — fully fair):")
-    print(f"    Raw+LS, UKF   : không tune (không có params)")
-    print(f"    Huber-UKF     : LOO cross-validation")
-    print(f"    MCC-UKF       : LOO cross-validation")
-    print(f"    GUKF          : LOO cross-validation")
-    print(f"    PC-UKF-2D     : LOO cross-validation (sigma-free)")
-    print(f"  → Tất cả filter tunable đều dùng cùng _grid_search_loo()")
-    print(f"  → In best mới ngay khi tìm thấy (RMSE + hệ số)")
+    print(f"\n  Workflow (V22 — 2 Phase):")
+    print(f"    Raw+LS, UKF   : khong tune (khong co params)")
+    print(f"    Cac filter con lai:")
+    print(f"    [Phase 1] LOO Tuning tren ca N files:")
+    print(f"              voi moi combo params: LOO-RMSE = trung binh RMSE qua N folds")
+    print(f"              chon best params co LOO-RMSE thap nhat")
+    print(f"    [Phase 2] Evaluate lai ca N files voi best params vua tim")
+    print(f"              ket qua cuoi cung phan anh performance thuc")
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     all_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.txt")))
     n = len(all_files)
     if n == 0:
-        print(f"\n[!] Không tìm thấy file .txt trong '{DATA_DIR}/'")
+        print(f"\n[!] Khong tim thay file .txt trong '{DATA_DIR}/'")
         return
-    print(f"\n  Tìm thấy {n} file(s) trong '{DATA_DIR}/'")
+    print(f"\n  Tim thay {n} file(s) trong '{DATA_DIR}/'")
 
     np.random.seed(42)
-    eval_files = [all_files[i] for i in np.random.permutation(n)]
+    all_files = [all_files[i] for i in np.random.permutation(n)]
 
     gt_xy, total_time = build_ground_truth(WAYPOINTS, SPEED, GT_SPACING)
     expected_path_length = np.linalg.norm(np.diff(WAYPOINTS, axis=0), axis=1).sum()
     print(f"  Path={expected_path_length:.0f}mm  Time={total_time:.1f}s  GT={len(gt_xy)} points")
 
+    # ══════════════════════════════════════════════════════════════════
+    #  PHASE 1 — LOO TUNING
+    #  Voi moi combo params: LOO-RMSE = mean(RMSE tren fold k) for k=0..N-1
+    #  Chon best params minimize LOO-RMSE tren toan bo N files.
+    # ══════════════════════════════════════════════════════════════════
     if DO_GRID_SEARCH:
-        print("\n  [LOO Grid Search] Tuning tất cả filters...")
+        print("\n" + "="*75)
+        print("  PHASE 1 — LOO TUNING (tim best params tu ca N files)")
+        print("="*75)
 
-        best_huber           = grid_search_huber(eval_files, gt_xy, expected_path_length)
-        best_mcc             = grid_search_mcc(eval_files,   gt_xy, expected_path_length)
-        best_gukf            = grid_search_gukf(eval_files,  gt_xy, expected_path_length)
-        best_pc, _           = grid_search_pcukf_loo(eval_files, gt_xy, expected_path_length)
+        best_huber = grid_search_huber(all_files, gt_xy, expected_path_length)
+        best_mcc   = grid_search_mcc(all_files,   gt_xy, expected_path_length)
+        best_gukf  = grid_search_gukf(all_files,  gt_xy, expected_path_length)
+        best_pc, _ = grid_search_pcukf_loo(all_files, gt_xy, expected_path_length)
 
         METHODS["Huber-UKF"] = (HuberUKF, best_huber)
         METHODS["MCC-UKF"]   = (MCCUKF,   best_mcc)
         METHODS["GUKF"]      = (GUKF,     best_gukf)
         METHODS["PC-UKF-2D"] = (PCUKF2D,  best_pc)
 
-        print(f"\n  ══ Params sau LOO grid search ══")
+        print(f"\n  Best params sau LOO tuning:")
         print(f"    Huber  : r={best_huber['r']}  delta={best_huber['delta']}")
         print(f"    MCC    : r={best_mcc['r']}  kernel_bw={best_mcc['kernel_bw']}")
         print(f"    GUKF   : r={best_gukf['r']}  sigma={best_gukf['sigma']}  n_half={best_gukf['n_half']}")
         print(f"    PC-UKF : r_base={best_pc['r_base']}  r_scale={best_pc['r_scale']}  [sigma-free]")
     else:
-        print(f"\n  [INFO] Grid Search TẮT — dùng params mặc định:")
-        print(f"    PC-UKF-2D: r_base={PCUKF_R_BASE} r_scale={PCUKF_R_SCALE} [sigma-free]")
+        print(f"\n  [INFO] Grid Search TAT — dung params mac dinh:")
+        print(f"    PC-UKF-2D: r_base={PCUKF_R_BASE} r_scale={PCUKF_R_SCALE}")
 
-    # ── Evaluate ──────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    #  PHASE 2 — FINAL EVALUATION (ca N files, voi best params)
+    # ══════════════════════════════════════════════════════════════════
+    print("\n" + "="*75)
+    print("  PHASE 2 — FINAL EVALUATION tren ca N files")
+    print("  (dung best params tu Phase 1)")
+    print("="*75)
+
     errors, positions, collapse_warn, per_file_rmse = evaluate_files(
-        eval_files, gt_xy, expected_path_length)
+        all_files, gt_xy, expected_path_length)
 
     # ── Summary table ─────────────────────────────────────────────────
     metrics = {}
-    print(f"\n{'═' * 110}")
-    print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed")
-    print(f"{'═' * 110}")
+    print(f"\n{'=':=<110s}")
+    print(f"  SUMMARY TABLE (mm)   — collapse = trajectory bi collapse")
+    print(f"  (Params tuned bang LOO tren N files, evaluate lai ca N files)")
+    print(f"{'=':=<110s}")
     print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
-          f"{'P95':>7s} {'MAX':>7s} {'RMSE mean±std':>16s} {'MotionR':>8s} {'Status'}")
-    print(f"  {'─' * 95}")
+          f"{'P95':>7s} {'MAX':>7s} {'RMSE mean+std':>16s} {'MotionR':>8s} {'Status'}")
+    print(f"  {'-'*95}")
 
     for label, errs in errors.items():
         if len(errs) == 0:
@@ -983,18 +997,17 @@ def main():
 
         pf_vals = [v for v in per_file_rmse.get(label, []) if not math.isnan(v)]
         if len(pf_vals) >= 2:
-            std_str = f"{np.mean(pf_vals):.1f} ± {np.std(pf_vals, ddof=1):.1f}"
+            std_str = f"{np.mean(pf_vals):.1f} +/- {np.std(pf_vals, ddof=1):.1f}"
         elif len(pf_vals) == 1:
-            std_str = f"{pf_vals[0]:.1f} ± N/A"
+            std_str = f"{pf_vals[0]:.1f} +/- N/A"
         else:
             std_str = "N/A"
 
         n_col  = len(collapse_warn.get(label, []))
-        status = f"⚠ {n_col} collapsed" if n_col > 0 else "✅ OK"
+        status = f"WARN {n_col} collapsed" if n_col > 0 else "OK"
         mr_str = (f"{m['motion_ratio']:.2f}"
                   if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A")
-        tag    = " ◀ LOO" if label == "PC-UKF-2D" else (
-                 " ◀ LOO" if label in ("Huber-UKF", "MCC-UKF", "GUKF") else "")
+        tag    = " < LOO" if label in ("Huber-UKF", "MCC-UKF", "GUKF", "PC-UKF-2D") else ""
         print(f"  {label:<14s} {m['rmse']:>7.1f} {m['mae']:>7.1f}"
               f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f} {m['max']:>7.1f}"
               f" {std_str:>16s}  {mr_str:>8s}  {status}{tag}")
@@ -1009,7 +1022,7 @@ def main():
         if N > 20:
             try:
                 _, p = wilcoxon(errs[:N], ref_err[:N])
-                sym  = '✅ p<0.05' if p < 0.05 else '⚠️  ns'
+                sym  = 'p<0.05 sig' if p < 0.05 else 'ns'
                 print(f"    {name:<14s} vs PC-UKF-2D: p={p:.4f}  {sym}")
             except ValueError:
                 pass
@@ -1024,7 +1037,7 @@ def main():
         safe = label.lower().replace('+', '_').replace('-', '_').replace(' ', '_')
         np.save(os.path.join(SAVE_DIR, f'errors_{safe}.npy'), errs)
 
-    print(f"\n[✓] Kết quả lưu tại '{SAVE_DIR}/'")
+    print(f"\n[OK] Ket qua luu tai '{SAVE_DIR}/'")
 
 
 if __name__ == "__main__":
