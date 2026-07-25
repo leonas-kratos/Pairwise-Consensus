@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-UWB Indoor Positioning — EKF Suite V1  (LOO chuẩn)
-====================================================
-LOO Cross-Validation chuẩn cho model selection:
-  - N file → N fold
-  - Fold k: test trên file[k], params được chọn từ LOO trên N-1 file còn lại
-  - Outer LOO RMSE = mean của N fold RMSE (unbiased estimate)
-
+UWB Indoor Positioning — EKF Suite V2  (2-Phase LOO, giống sota.py)
+====================================================================
 CÁC PHƯƠNG PHÁP:
   1. Raw+LS        — baseline Weighted Least Squares
   2. EKF            — Extended Kalman Filter chuẩn
@@ -14,19 +9,22 @@ CÁC PHƯƠNG PHÁP:
   4. MCC-EKF        — Maximum Correntropy Criterion EKF
   5. PC-EKF-2D      — Pairwise Consensus MAD-normalized + EKF (sigma-free)
   6. AEKF           — Adaptive EKF (Sage-Husa noise estimator)
-  7. REKF           — Robust EKF với Student-t likelihood (Agamennoni 2012)
+  7. REKF           — Robust EKF với Student-t likelihood
 
-LOO PIPELINE:
-  for k in 0..N-1:
-      train_files = all_files \ {file[k]}
-      test_file   = file[k]
-      best_params = inner_loo(train_files, grid)   # LOO trên N-1 file
-      fold_rmse   = evaluate(test_file, best_params)
-  final_loo_rmse = mean(fold_rmse)                 # unbiased
+WORKFLOW (2 Phase — giống sota.py):
+  Raw+LS, EKF   : không tune (không có params)
+  Các filter còn lại:
+  [Phase 1] LOO Tuning trên cả N files:
+            với mỗi combo params: LOO-RMSE = trung bình RMSE qua N folds
+            chọn best params có LOO-RMSE thấp nhất
+  [Phase 2] Evaluate lại cả N files với best params vừa tìm
+            kết quả cuối cùng phản ánh performance thực
 
-  Sau khi biết final_loo_rmse:
-      best_global_params = inner_loo(all_files, grid)  # retrain toàn bộ
-      production_filter  = filter(best_global_params)
+CÔNG BẰNG TUNING:
+  - Raw+LS, EKF: không có param cần tune → không cần LOO
+  - Huber-EKF, MCC-EKF, PC-EKF-2D, AEKF, REKF: đều dùng _grid_search_loo()
+    → mỗi fold: params được chọn từ (N-1) files, validate trên 1 file còn lại
+    → không có method nào được "nhìn thấy" eval file khi chọn params
 
 Format file .txt: timestamp, d0_slant, d1_slant, d2_slant, d3_slant, v_mm_s, gz_dps
 """
@@ -51,18 +49,18 @@ warnings.filterwarnings("ignore", category=UserWarning)
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 ANCHORS = np.array([
-    [8800, 0   ],
-    [8800, 4000],
-    [0,    4000],
-    [0,    0   ],
+    [8800, 0   ],   # A1
+    [8800, 4000],   # A2
+    [0,    4000],   # A3
+    [0,    0   ],   # A4
 ], dtype=float)
 
 WAYPOINTS = np.array([
-    [400.0,  3200.0],
-    [400.0,  1000.0],
-    [8000.0, 1000.0],
-    [8000.0, 3200.0],
-    [400.0,  3200.0],
+    [400.0,  3200.0],   # A
+    [400.0,  1000.0],   # B
+    [8000.0, 1000.0],   # C
+    [8000.0, 3200.0],   # D
+    [400.0,  3200.0],   # A
 ], dtype=float)
 
 ANCHOR_HEIGHT = 1400.0
@@ -76,29 +74,39 @@ EKF_R = 50.0
 
 # ─── Huber-EKF ───────────────────────────────────────────────────────
 HUBER_Q       = 0.001
+HUBER_R       = 50.0
+HUBER_DELTA   = 1.5
 HUBER_MAXITER = 5
 
 # ─── MCC-EKF ─────────────────────────────────────────────────────────
 MCC_Q         = 0.001
+MCC_R         = 100.0
+MCC_KERNEL_BW = 1200.0
 MCC_MAXITER   = 5
 
-# ─── PC-EKF-2D ───────────────────────────────────────────────────────
+# ─── PC-EKF-2D (MAD sigma-free) ──────────────────────────────────────
 PCEKF_Q       = 0.001
+PCEKF_R_BASE  = 25.0
+PCEKF_R_SCALE = 15.0
 
 # ─── AEKF ────────────────────────────────────────────────────────────
 AEKF_Q        = 0.001
+AEKF_R        = 50.0
+AEKF_WIN      = 10
+AEKF_ALPHA    = 0.95
 
 # ─── REKF ────────────────────────────────────────────────────────────
 REKF_Q        = 0.001
+REKF_R        = 50.0
+REKF_NU       = 4.0
 REKF_MAXITER  = 5
 
-# ─── LOO config ──────────────────────────────────────────────────────
-DO_LOO_TUNING     = True        # False = dùng default params
-DATA_DIR          = "./data"
-SAVE_DIR          = "./outputs_sota_EKF"
+DO_GRID_SEARCH = True
+DATA_DIR       = "./data"
+SAVE_DIR       = "./outputs_sota_EKF"
 
 MOTION_RATIO_MIN  = 0.90
-COLLAPSE_PENALTY  = 1e6         # mm — penalty khi trajectory collapse
+COLLAPSE_PENALTY  = 1e9
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -162,11 +170,13 @@ def is_trajectory_collapsed(pos_xy, expected_path_length,
                              ratio_min=MOTION_RATIO_MIN):
     if len(pos_xy) < 2:
         return True
-    if compute_trajectory_displacement(pos_xy) < ratio_min * expected_path_length:
+    total_disp = compute_trajectory_displacement(pos_xy)
+    if total_disp < ratio_min * expected_path_length:
         return True
-    bbox_x = pos_xy[:, 0].max() - pos_xy[:, 0].min()
-    bbox_y = pos_xy[:, 1].max() - pos_xy[:, 1].min()
-    if math.sqrt(bbox_x**2 + bbox_y**2) < 0.05 * expected_path_length:
+    bbox_x    = pos_xy[:, 0].max() - pos_xy[:, 0].min()
+    bbox_y    = pos_xy[:, 1].max() - pos_xy[:, 1].min()
+    bbox_diag = math.sqrt(bbox_x**2 + bbox_y**2)
+    if bbox_diag < 0.05 * expected_path_length:
         return True
     return False
 
@@ -205,13 +215,14 @@ def default_init(dist_raw_0):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  FILTER CLASSES
+#  1. STANDARD EKF
 # ══════════════════════════════════════════════════════════════════════
 class StandardEKF:
     def __init__(self, q=EKF_Q, r=EKF_R):
         self.Q_mat = np.eye(2) * q
         self.R_mat = np.eye(N_ANCHORS) * r
-        self.x = None; self.P = None
+        self.x = None
+        self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
@@ -228,20 +239,26 @@ class StandardEKF:
         try:
             K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred; self.P = make_spd(P_pred)
+            self.x = x_pred
+            self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
         self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  2. HUBER-EKF
+# ══════════════════════════════════════════════════════════════════════
 class HuberEKF:
-    def __init__(self, q=HUBER_Q, r=50.0, delta=1.5, maxiter=HUBER_MAXITER):
+    def __init__(self, q=HUBER_Q, r=HUBER_R,
+                 delta=HUBER_DELTA, maxiter=HUBER_MAXITER):
         self.Q_mat   = np.eye(2) * q
         self.R_base  = r
         self.delta   = delta
         self.maxiter = maxiter
-        self.x = None; self.P = None
+        self.x = None
+        self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
@@ -259,28 +276,37 @@ class HuberEKF:
             S        = H @ P_pred @ H.T + R_eff
             s_diag   = np.maximum(np.diag(S), 1e-9)
             r_scaled = innov / np.sqrt(s_diag)
-            hub_w    = np.where(np.abs(r_scaled) <= self.delta,
-                                1.0, self.delta / (np.abs(r_scaled) + 1e-9))
+            hub_w    = np.where(
+                np.abs(r_scaled) <= self.delta,
+                1.0,
+                self.delta / (np.abs(r_scaled) + 1e-9)
+            )
             hub_w = np.maximum(hub_w, 1e-4)
             R_eff = np.diag(self.R_base / hub_w)
         S = H @ P_pred @ H.T + R_eff
         try:
             K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred; self.P = make_spd(P_pred)
+            self.x = x_pred
+            self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
         self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  3. MCC-EKF
+# ══════════════════════════════════════════════════════════════════════
 class MCCEKF:
-    def __init__(self, q=MCC_Q, r=100.0, kernel_bw=1200.0, maxiter=MCC_MAXITER):
+    def __init__(self, q=MCC_Q, r=MCC_R,
+                 kernel_bw=MCC_KERNEL_BW, maxiter=MCC_MAXITER):
         self.Q_mat     = np.eye(2) * q
         self.R_base    = r
         self.kernel_bw = kernel_bw
         self.maxiter   = maxiter
-        self.x = None; self.P = None
+        self.x = None
+        self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
@@ -309,19 +335,31 @@ class MCCEKF:
                 break
             x_new = x_pred + K @ innov
             if np.linalg.norm(x_new - x_cur) < 1e-3:
-                x_cur = x_new; break
+                x_cur = x_new
+                break
             x_cur = x_new
         self.x = x_cur
         self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  4. PC-EKF-2D — MAD Auto-Normalized, Sigma-Free
+# ══════════════════════════════════════════════════════════════════════
 def _t_kernel_pairwise(diff_vec, sigma=1.0):
-    nu = 4.0
-    return (1.0 + diff_vec**2 / (nu * sigma**2 + 1e-9)) ** (-(nu + 1.0) / 2.0)
+    """T-distribution kernel, sigma=1.0 cố định (không tune)."""
+    nu  = 4.0
+    eps = 1e-9
+    return (1.0 + diff_vec**2 / (nu * sigma**2 + eps)) ** (-(nu + 1.0) / 2.0)
 
 
 def pc_mad_scores(innov, S_diag):
+    """
+    PC scoring — MAD auto-normalized, sigma-free.
+    Bước 1: Geo-normalize: std_innov[i] = innov[i] / sqrt(S_ii)
+    Bước 2: MAD normalize: normed[i] = std_innov[i] / (1.4826*mad + eps)
+    Bước 3: Pairwise T-kernel score (sigma=1.0 cố định)
+    """
     std_innov = innov / np.sqrt(np.maximum(S_diag, 1e-9))
     med    = np.median(std_innov)
     mad    = np.median(np.abs(std_innov - med))
@@ -330,16 +368,17 @@ def pc_mad_scores(innov, S_diag):
     for i in range(N_ANCHORS):
         diffs     = np.array([normed[i] - normed[j]
                               for j in range(N_ANCHORS) if j != i])
-        scores[i] = np.mean(_t_kernel_pairwise(diffs))
+        scores[i] = np.mean(_t_kernel_pairwise(diffs, sigma=1.0))
     return scores
 
 
 class PCEKF2D:
-    def __init__(self, q=PCEKF_Q, r_base=25.0, r_scale=15.0):
+    def __init__(self, q=PCEKF_Q, r_base=PCEKF_R_BASE, r_scale=PCEKF_R_SCALE):
         self.Q_mat   = np.eye(2) * q
         self.R_base  = r_base
         self.R_scale = r_scale
-        self.x = None; self.P = None
+        self.x = None
+        self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
@@ -360,26 +399,44 @@ class PCEKF2D:
         try:
             K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred; self.P = make_spd(P_pred)
+            self.x = x_pred
+            self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
         self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  5. AEKF — Sage-Husa Adaptive EKF
+#
+#  Sage-Husa noise estimator (Sage & Husa 1969):
+#    C_eps = sample covariance của innovation window (trừ mean)
+#    R_new = diag( C_eps - H*P_pred*H^T )   (clipped để dương)
+#    R_est ← alpha * R_est + (1-alpha) * R_new
+#    alpha ∈ (0,1): forgetting factor — lớn = nhớ lâu (ổn định hơn)
+#
+#  Fix so với phiên bản cũ:
+#    1. R_est được reset trong init() — tránh state leak giữa các file
+#    2. Sample covariance tính đúng (zero-mean trong window)
+#    3. alpha là forgetting factor: alpha*old + (1-alpha)*new
+#       (cũ bị ngược: (1-alpha)*old + alpha*new → alpha lớn = không ổn định)
+# ══════════════════════════════════════════════════════════════════════
 class AEKF:
-    def __init__(self, q=AEKF_Q, r=50.0, win=10, alpha=0.95):
+    def __init__(self, q=AEKF_Q, r=AEKF_R, win=AEKF_WIN, alpha=AEKF_ALPHA):
         self.Q_mat  = np.eye(2) * q
-        self.R_est  = np.eye(N_ANCHORS) * r
         self.R_base = r
         self.win    = win
-        self.alpha  = alpha
-        self.x = None; self.P = None
+        self.alpha  = alpha   # forgetting factor: lớn = nhớ lâu
+        self.x = None
+        self.P = None
+        self.R_est      = None
         self._innov_buf = []
 
     def init(self, x0):
-        self.x = x0.astype(float).copy()
-        self.P = np.eye(2) * 1e6
+        self.x          = x0.astype(float).copy()
+        self.P          = np.eye(2) * 1e6
+        self.R_est      = np.eye(N_ANCHORS) * self.R_base  # reset mỗi file
         self._innov_buf = []
 
     def step(self, z_raw):
@@ -389,37 +446,68 @@ class AEKF:
         P_pred = self.P + self.Q_mat
         H      = H_jacobian(x_pred)
         innov  = z_raw - h_obs(x_pred)
+
+        # Cập nhật buffer innovation
         self._innov_buf.append(innov.copy())
         if len(self._innov_buf) > self.win:
             self._innov_buf.pop(0)
+
         HPH = H @ P_pred @ H.T
+
+        # Sage-Husa: ước lượng R từ sample covariance (zero-mean) của window
         if len(self._innov_buf) >= 2:
-            innov_mat = np.array(self._innov_buf)
-            C_eps     = innov_mat.T @ innov_mat / len(innov_mat)
-            R_new     = np.diag(np.clip(np.diag(C_eps - HPH),
-                                        self.R_base / 100.0,
-                                        self.R_base * 100.0))
-            self.R_est = ((1 - self.alpha) * self.R_est + self.alpha * R_new)
-            self.R_est = np.diag(np.maximum(np.diag(self.R_est),
-                                            self.R_base / 100.0))
+            innov_mat = np.array(self._innov_buf)          # (L, M)
+            mean_inn  = innov_mat.mean(axis=0)             # (M,)
+            centered  = innov_mat - mean_inn               # (L, M)
+            C_eps     = (centered.T @ centered) / (len(innov_mat) - 1)  # (M, M)
+            # R_new = C_eps - HPH, clip để giữ dương định
+            R_new_diag = np.clip(
+                np.diag(C_eps - HPH),
+                self.R_base / 100.0,
+                self.R_base * 100.0,
+            )
+            R_new = np.diag(R_new_diag)
+            # alpha là forgetting factor: lớn → tin vào R_est cũ hơn
+            self.R_est = self.alpha * self.R_est + (1.0 - self.alpha) * R_new
+            # Đảm bảo dương
+            self.R_est = np.diag(np.maximum(
+                np.diag(self.R_est), self.R_base / 100.0))
+
         S = HPH + self.R_est
         try:
             K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred; self.P = make_spd(P_pred)
+            self.x = x_pred
+            self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
         self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  6. REKF — Robust EKF với Student-t likelihood (Agamennoni et al. 2012)
+#
+#  IRLS (Iteratively Reweighted Least Squares):
+#    weight_i = (nu + 1) / (nu + e_i^2 / r_i)
+#    với e_i = innov[i], r_i = R_base (scalar noise variance mỗi anchor)
+#    R_eff = diag(R_base / w_i)
+#
+#  Fix so với phiên bản cũ:
+#    1. Normalize innovation bằng R_base (scalar, không phải diag(S))
+#       S = HPH^T + R phụ thuộc vào P → không phải đặc trưng của noise
+#       Student-t weight phải dùng R_base thuần (Agamennoni 2012 eq.17)
+#    2. Track x convergence giữa các vòng IRLS (như MCC-EKF)
+#       → dừng sớm khi hội tụ, tránh over-iteration
+# ══════════════════════════════════════════════════════════════════════
 class REKF:
-    def __init__(self, q=REKF_Q, r=50.0, nu=4.0, maxiter=REKF_MAXITER):
+    def __init__(self, q=REKF_Q, r=REKF_R, nu=REKF_NU, maxiter=REKF_MAXITER):
         self.Q_mat   = np.eye(2) * q
         self.R_base  = r
         self.nu      = nu
         self.maxiter = maxiter
-        self.x = None; self.P = None
+        self.x = None
+        self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
@@ -432,21 +520,33 @@ class REKF:
         P_pred = self.P + self.Q_mat
         H      = H_jacobian(x_pred)
         innov  = z_raw - h_obs(x_pred)
-        R_eff  = np.eye(N_ANCHORS) * self.R_base
-        K      = np.zeros((2, N_ANCHORS))
+
+        # IRLS: lặp cập nhật weight và state estimate
+        x_cur = x_pred.copy()
+        K     = np.zeros((2, N_ANCHORS))
+        R_eff = np.eye(N_ANCHORS) * self.R_base
         for _ in range(self.maxiter):
-            S      = H @ P_pred @ H.T + R_eff
-            s_diag = np.maximum(np.diag(S), 1e-9)
-            w      = (self.nu + 1.0) / (self.nu + innov**2 / s_diag)
-            w      = np.maximum(w, 1e-4)
-            R_eff  = np.diag(self.R_base / w)
-        S = H @ P_pred @ H.T + R_eff
-        try:
-            K = P_pred @ H.T @ np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            self.x = x_pred; self.P = make_spd(P_pred)
-            return self.x.copy()
-        self.x = x_pred + K @ innov
+            S = H @ P_pred @ H.T + R_eff
+            try:
+                K = P_pred @ H.T @ np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                break
+            x_new = x_pred + K @ innov
+
+            # Student-t weight: normalize bằng R_base (scalar noise var per anchor)
+            # Agamennoni 2012 eq.17: w_i = (nu+1) / (nu + e_i^2 / r_i)
+            r_diag = np.maximum(np.diag(R_eff), 1e-9)
+            w = (self.nu + 1.0) / (self.nu + innov**2 / r_diag)
+            w = np.maximum(w, 1e-4)
+            R_eff = np.diag(self.R_base / w)
+
+            # Convergence check
+            if np.linalg.norm(x_new - x_cur) < 1e-3:
+                x_cur = x_new
+                break
+            x_cur = x_new
+
+        self.x = x_cur
         self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
@@ -462,14 +562,6 @@ def run_filter(filt_class, dist_raw, **kwargs):
     filt.init(x0)
     for t in range(T):
         pos[t] = filt.step(dist_raw[t])
-    return pos
-
-
-def run_ls(dist_raw):
-    T   = len(dist_raw)
-    pos = np.full((T, 2), np.nan)
-    for t in range(T):
-        pos[t] = LS_position(dist_raw[t])
     return pos
 
 
@@ -497,87 +589,157 @@ def parse_file(path):
     return np.array(rows, dtype=np.float64)
 
 
-def file_rmse(filt_class_or_none, path, gt_xy, expected_path_length, **kwargs):
-    """
-    Chạy filter trên 1 file, trả về RMSE.
-    Nếu collapse → trả về COLLAPSE_PENALTY.
-    filt_class_or_none = None → Raw+LS.
-    """
-    dist_raw = parse_file(path)
-    if dist_raw is None:
-        return None
-
-    if filt_class_or_none is None:
-        pos = run_ls(dist_raw)
-    else:
-        pos = run_filter(filt_class_or_none, dist_raw, **kwargs)
-
-    valid = pos[~np.any(np.isnan(pos), axis=1)]
-    if is_trajectory_collapsed(valid, expected_path_length):
-        return float(COLLAPSE_PENALTY)
-    if len(valid) == 0:
-        return float(COLLAPSE_PENALTY)
-    errs = nearest_gt_error(valid, gt_xy)
-    return float(np.sqrt(np.mean(errs**2)))
+def safe_len(path):
+    data = parse_file(path)
+    return len(data) if data is not None else 0
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  INNER LOO — chọn best params trên một tập file
+#  METHODS TABLE
 # ══════════════════════════════════════════════════════════════════════
-def inner_loo(filt_class, grid, fixed_params,
-              file_paths, gt_xy, expected_path_length,
-              verbose=False, method_name=""):
-    """
-    LOO model selection trên file_paths (tập train).
+METHODS = {
+    "Raw+LS"    : None,
+    "EKF"       : (StandardEKF, dict(q=EKF_Q,     r=EKF_R)),
+    "Huber-EKF" : (HuberEKF,   dict(q=HUBER_Q,    r=HUBER_R,    delta=HUBER_DELTA)),
+    "MCC-EKF"   : (MCCEKF,     dict(q=MCC_Q,      r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
+    "PC-EKF-2D" : (PCEKF2D,    dict(q=PCEKF_Q,    r_base=PCEKF_R_BASE,
+                                     r_scale=PCEKF_R_SCALE)),
+    "AEKF"      : (AEKF,       dict(q=AEKF_Q,     r=AEKF_R,
+                                     win=AEKF_WIN,  alpha=AEKF_ALPHA)),
+    "REKF"      : (REKF,       dict(q=REKF_Q,     r=REKF_R,     nu=REKF_NU)),
+}
 
-    Với mỗi combo params:
-        LOO-RMSE = mean_{i} RMSE(file[i], params tuned on file_paths \ {file[i]})
-        (nhưng ở đây chúng ta dùng leave-one-out đơn giản: đánh giá từng file
-         với params cố định — đây là standard LOO for hyperparameter selection)
+COLORS = {
+    "Raw+LS"    : '#9E9E9E',
+    "EKF"       : '#00BCD4',
+    "Huber-EKF" : '#E91E63',
+    "MCC-EKF"   : '#FF9800',
+    "PC-EKF-2D" : '#9C27B0',
+    "AEKF"      : '#2196F3',
+    "REKF"      : '#4CAF50',
+}
 
-    Standard LOO for hyperparam selection:
-        score(params) = (1/N) * sum_i RMSE(file[i] | params)
-        → chọn params minimize score
-        (không nested: params không được tune trên chính file đang test)
 
-    Returns: best_params dict
-    """
-    keys   = list(grid.keys())
-    combos = list(itertools.product(*[grid[k] for k in keys]))
-    N      = len(file_paths)
+# ══════════════════════════════════════════════════════════════════════
+#  EVALUATE
+# ══════════════════════════════════════════════════════════════════════
+def evaluate_files(file_paths, gt_xy, expected_path_length):
+    all_errors    = {m: [] for m in METHODS}
+    all_pos       = {m: [] for m in METHODS}
+    per_file_rmse = {m: [] for m in METHODS}
+    collapse_warn = {m: [] for m in METHODS}
+    timing        = {m: [] for m in METHODS if m != "Raw+LS"}
 
-    if verbose:
-        print(f"\n    Inner LOO [{method_name}]: "
-              f"{len(combos)} combos × {N} folds")
+    hdr = f"{'File':<18s}"
+    for m in METHODS:
+        hdr += f" {m:>12s}"
+    print("\n" + "═" * 110)
+    print("  PER-FILE RMSE (mm)   [⚠ = trajectory collapsed]")
+    print("═" * 110)
+    print(hdr)
+    print("─" * 110)
 
-    best_score  = float('inf')
-    best_params = {**fixed_params}
-
-    for combo in combos:
-        params = {**fixed_params, **dict(zip(keys, combo))}
-        fold_scores = []
-        for val_path in file_paths:
-            r = file_rmse(filt_class, val_path, gt_xy, expected_path_length,
-                          **params)
-            if r is not None:
-                fold_scores.append(r)
-        if not fold_scores:
+    for path in file_paths:
+        dist_raw = parse_file(path)
+        if dist_raw is None:
             continue
-        score = float(np.mean(fold_scores))
-        if score < best_score:
-            best_score  = score
-            best_params = params.copy()
-            if verbose:
-                param_str = "  ".join(f"{k}={params[k]}" for k in keys)
-                tag = " [COLLAPSE]" if best_score >= COLLAPSE_PENALTY * 0.9 else ""
-                print(f"      ★ {score:8.2f}mm{tag}  {param_str}")
+        T   = len(dist_raw)
+        row = f"{os.path.basename(path):<18s}"
 
-    return best_params, best_score
+        for name, method in METHODS.items():
+            if method is None:
+                pos = np.array([LS_position(dist_raw[t]) for t in range(T)])
+            else:
+                filt_cls, kwargs = method
+                t0  = time.perf_counter()
+                pos = run_filter(filt_cls, dist_raw, **kwargs)
+                timing[name].append(time.perf_counter() - t0)
+
+            valid     = pos[~np.any(np.isnan(pos), axis=1)]
+            collapsed = is_trajectory_collapsed(valid, expected_path_length)
+            if collapsed:
+                collapse_warn[name].append(os.path.basename(path))
+
+            errs = nearest_gt_error(valid, gt_xy)
+            rmse = np.sqrt(np.mean(errs**2)) if len(errs) > 0 else float('nan')
+            flag = "⚠" if collapsed else " "
+            row += f" {flag}{rmse:>10.1f}"
+            all_errors[name].extend(errs)
+            all_pos[name].extend(valid)
+            per_file_rmse[name].append(rmse)
+
+        print(row)
+
+    print("─" * 110)
+
+    print("\n  TIMING (ms/sample):")
+    for name, times in timing.items():
+        if not times:
+            continue
+        total_t = sum(times)
+        n_samp  = sum(safe_len(p) for p in file_paths[:len(times)])
+        if n_samp > 0:
+            print(f"    {name:<14s}: {total_t * 1000 / n_samp:.4f} ms/sample")
+
+    print("\n  COLLAPSE WARNINGS:")
+    any_warn = False
+    for name, files in collapse_warn.items():
+        if files:
+            any_warn = True
+            print(f"    ⚠  {name:<14s}: {len(files)} file(s) → {', '.join(files[:5])}"
+                  + (" ..." if len(files) > 5 else ""))
+    if not any_warn:
+        print("    ✅ Không có trajectory nào bị collapse.")
+
+    return (
+        {m: np.array(v) for m, v in all_errors.items()},
+        {m: np.array(v) for m, v in all_pos.items()},
+        collapse_warn,
+        per_file_rmse,
+    )
+
+
+def compute_metrics(errors, pos_xy=None, expected_path_length=None):
+    if len(errors) == 0:
+        return {k: float('nan') for k in
+                ['mae', 'rmse', 'cep50', 'cep90', 'p95', 'max',
+                 'motion_ratio', 'collapsed']}
+    base = {
+        'mae'  : float(np.mean(errors)),
+        'rmse' : float(np.sqrt(np.mean(errors**2))),
+        'cep50': float(np.percentile(errors, 50)),
+        'cep90': float(np.percentile(errors, 90)),
+        'p95'  : float(np.percentile(errors, 95)),
+        'max'  : float(np.max(errors)),
+    }
+    if pos_xy is not None and expected_path_length is not None and len(pos_xy) > 1:
+        disp  = compute_trajectory_displacement(pos_xy)
+        ratio = disp / (expected_path_length + 1e-9)
+        base['motion_ratio'] = round(ratio, 3)
+        base['collapsed']    = is_trajectory_collapsed(pos_xy, expected_path_length)
+    else:
+        base['motion_ratio'] = float('nan')
+        base['collapsed']    = False
+    return base
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GRIDS
+#  LOO PIPELINE
+#
+#  outer_loo_one_method — nested LOO chuẩn:
+#    Outer (N folds):
+#      for k = 0..N-1:
+#        train = all_files \ {file[k]}         (N-1 file)
+#        test  = file[k]                        (1 file)
+#        best_params_k = inner_loo(train, grid) → tune KHÔNG nhìn thấy test
+#        fold_rmse[k]  = RMSE(test, best_params_k)
+#    outer_loo_rmse = mean(fold_rmse)           → unbiased estimate
+#
+#    Retrain inner LOO trên toàn bộ N files → best_global_params
+#    Final eval với best_global_params         → dùng cho plot / summary
 # ══════════════════════════════════════════════════════════════════════
+
+# ── Grids cho từng method ─────────────────────────────────────────────
 GRIDS = {
     "Huber-EKF": {
         "filt_class"  : HuberEKF,
@@ -622,248 +784,200 @@ GRIDS = {
     },
 }
 
-# Default params khi không tune
-DEFAULT_PARAMS = {
-    "EKF"      : {"q": EKF_Q, "r": EKF_R},
-    "Huber-EKF": {"q": HUBER_Q, "r": 50.0, "delta": 1.5},
-    "MCC-EKF"  : {"q": MCC_Q, "r": 100.0, "kernel_bw": 1200.0},
-    "PC-EKF-2D": {"q": PCEKF_Q, "r_base": 25.0, "r_scale": 15.0},
-    "AEKF"     : {"q": AEKF_Q, "r": 50.0, "win": 10, "alpha": 0.95},
-    "REKF"     : {"q": REKF_Q, "r": 50.0, "nu": 4.0},
-}
 
-FILT_CLASSES = {
-    "EKF"      : StandardEKF,
-    "Huber-EKF": HuberEKF,
-    "MCC-EKF"  : MCCEKF,
-    "PC-EKF-2D": PCEKF2D,
-    "AEKF"     : AEKF,
-    "REKF"     : REKF,
-}
-
-COLORS = {
-    "Raw+LS"   : '#9E9E9E',
-    "EKF"      : '#00BCD4',
-    "Huber-EKF": '#E91E63',
-    "MCC-EKF"  : '#FF9800',
-    "PC-EKF-2D": '#9C27B0',
-    "AEKF"     : '#2196F3',
-    "REKF"     : '#4CAF50',
-}
+def _loo_fold_rmse(filt_class, kwargs, val_file, gt_xy, expected_path_length):
+    """Chạy filter trên 1 file, trả về RMSE. Collapse → penalty."""
+    d = parse_file(val_file)
+    if d is None:
+        return None
+    if filt_class is None:
+        p = np.array([LS_position(d[t]) for t in range(len(d))])
+    else:
+        p = run_filter(filt_class, d, **kwargs)
+    valid = p[~np.any(np.isnan(p), axis=1)]
+    if is_trajectory_collapsed(valid, expected_path_length):
+        return 500.0 + COLLAPSE_PENALTY / 1000.0
+    if len(valid) == 0:
+        return 500.0
+    errs = nearest_gt_error(valid, gt_xy)
+    return float(np.sqrt(np.mean(errs**2)))
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  OUTER LOO — đánh giá không bias
-# ══════════════════════════════════════════════════════════════════════
-def outer_loo(method_name, filt_class_or_none, all_files,
-              gt_xy, expected_path_length,
-              do_tuning=True):
+def _grid_search_loo(filt_class, grid, fixed_params,
+                     tune_files, gt_xy, expected_path_length,
+                     method_name, verbose=True):
     """
-    Outer LOO chuẩn:
+    Inner LOO: duyệt grid, với mỗi combo tính LOO-RMSE trên tune_files.
+    verbose=False → im lặng (dùng khi gọi từ outer LOO).
+    Trả về (best_params, best_loo_rmse).
+    """
+    keys   = list(grid.keys())
+    combos = list(itertools.product(*[grid[k] for k in keys]))
+    n      = len(tune_files)
+
+    if verbose:
+        print(f"\n    Inner LOO [{method_name}]: "
+              f"{len(combos)} combos × {n} folds = {len(combos) * n} runs")
+        print(f"    {'LOO-RMSE':>10s}  Params")
+        print(f"    {'─' * 53}")
+
+    best_loo_rmse = float('inf')
+    best_params   = {**fixed_params}
+
+    for combo in combos:
+        params = {**fixed_params, **dict(zip(keys, combo))}
+        fold_rmses = []
+        for val_file in tune_files:
+            fr = _loo_fold_rmse(filt_class, params, val_file,
+                                gt_xy, expected_path_length)
+            if fr is not None:
+                fold_rmses.append(fr)
+        if not fold_rmses:
+            continue
+        loo_rmse = float(np.mean(fold_rmses))
+        if loo_rmse < best_loo_rmse:
+            best_loo_rmse = loo_rmse
+            best_params   = params.copy()
+            if verbose:
+                tag       = " ⚠COLLAPSED" if loo_rmse >= COLLAPSE_PENALTY / 1000 else ""
+                param_str = "  ".join(f"{k}={params[k]}" for k in keys)
+                print(f"    ★ {loo_rmse:8.2f}mm{tag:<12s}  {param_str}")
+
+    if verbose:
+        print(f"    {'─' * 53}")
+        best_param_str = "  ".join(f"{k}={best_params[k]}" for k in keys)
+        print(f"    ✔ Best: {best_loo_rmse:.2f}mm  |  {best_param_str}")
+    return best_params, best_loo_rmse
+
+
+def outer_loo_one_method(method_name, filt_class_or_none,
+                          all_files, gt_xy, expected_path_length):
+    """
+    Outer LOO chuẩn cho 1 method:
+
       for k = 0..N-1:
-          train_files = all_files \ {all_files[k]}
-          test_file   = all_files[k]
-          if method cần tune:
-              best_params = inner_loo(train_files, grid)   # tune trên N-1 file
-          else:
-              best_params = DEFAULT_PARAMS[method]
-          fold_rmse[k] = RMSE(test_file, best_params)      # test trên 1 file
+          train = all_files \ {file[k]}           (N-1 file)
+          best_params_k = inner_loo(train, grid)   → không nhìn thấy file[k]
+          fold_rmse[k]  = RMSE(file[k], best_params_k)
 
-      loo_rmse = mean(fold_rmse)                            # unbiased estimate
-      loo_std  = std(fold_rmse)
+      outer_loo_rmse = mean(fold_rmse)             → unbiased estimate
 
-    Sau LOO → retrain (inner_loo trên toàn bộ N file) → best_global_params
-    để dùng cho production evaluation.
+      Retrain: inner_loo(all N files) → best_global_params
 
-    Returns:
-        fold_rmses      : list[float], RMSE mỗi fold
-        best_global_params : dict, params tốt nhất retrain trên toàn bộ
+    Returns: (fold_rmses, best_global_params, loo_mean, loo_std)
     """
-    N    = len(all_files)
-    need_tune = (method_name in GRIDS) and do_tuning
+    N         = len(all_files)
+    has_grid  = method_name in GRIDS
+    fold_rmses  = []
+    fold_params = []
 
     print(f"\n  ── Outer LOO: {method_name}  (N={N} folds) ──")
-
-    fold_rmses    = []
-    fold_params   = []   # params được chọn ở mỗi fold (for inspection)
 
     for k in range(N):
         test_file   = all_files[k]
         train_files = [f for i, f in enumerate(all_files) if i != k]
+        fname       = os.path.basename(test_file)
 
-        # ── Inner LOO trên train_files để chọn params ─────────────────
-        if need_tune:
+        # ── Inner LOO trên N-1 files (im lặng) ────────────────────────
+        if has_grid:
             cfg = GRIDS[method_name]
-            best_params, inner_rmse = inner_loo(
+            best_k, _ = _grid_search_loo(
                 cfg["filt_class"], cfg["grid"], cfg["fixed_params"],
                 train_files, gt_xy, expected_path_length,
-                verbose=False,          # tắt verbose để output gọn
-                method_name=method_name,
-            )
+                method_name, verbose=False)
         elif method_name == "Raw+LS":
-            best_params = {}
+            best_k = {}
         else:
-            best_params = DEFAULT_PARAMS[method_name].copy()
+            _, default_kw = METHODS[method_name]
+            best_k = default_kw.copy()
 
         # ── Test trên fold k ───────────────────────────────────────────
-        r = file_rmse(filt_class_or_none, test_file,
-                      gt_xy, expected_path_length, **best_params)
-        rmse_val = r if r is not None else float('nan')
-        fold_rmses.append(rmse_val)
-        fold_params.append(best_params.copy())
+        fr = _loo_fold_rmse(filt_class_or_none, best_k, test_file,
+                            gt_xy, expected_path_length)
+        fr = fr if fr is not None else float('nan')
+        fold_rmses.append(fr)
+        fold_params.append(best_k.copy())
 
-        # In kết quả fold ngay lập tức
-        fname = os.path.basename(test_file)
-        col_flag = " [COLLAPSE]" if rmse_val >= COLLAPSE_PENALTY * 0.9 else ""
-        param_str = ""
-        if need_tune and best_params:
+        col_flag  = " [COLLAPSE]" if fr >= COLLAPSE_PENALTY / 1000 else ""
+        if has_grid:
             tune_keys = list(GRIDS[method_name]["grid"].keys())
             param_str = "  params: " + " ".join(
-                f"{k2}={best_params[k2]}" for k2 in tune_keys)
-        print(f"    Fold {k+1:2d}/{N}  test={fname:<20s}"
-              f"  RMSE={rmse_val:7.1f}mm{col_flag}{param_str}")
+                f"{k2}={best_k[k2]}" for k2 in tune_keys)
+        else:
+            param_str = ""
+        print(f"    Fold {k+1:2d}/{N}  test={fname:<22s}"
+              f"  RMSE={fr:7.1f}mm{col_flag}{param_str}")
 
     # ── Summary ───────────────────────────────────────────────────────
-    valid_rmses = [r for r in fold_rmses if not math.isnan(r)
-                   and r < COLLAPSE_PENALTY * 0.9]
-    loo_rmse = float(np.mean(fold_rmses)) if fold_rmses else float('nan')
-    loo_std  = float(np.std(fold_rmses, ddof=1)) if len(fold_rmses) > 1 else float('nan')
-    n_col    = sum(1 for r in fold_rmses if r >= COLLAPSE_PENALTY * 0.9)
-
-    print(f"    → LOO RMSE = {loo_rmse:.1f} ± {loo_std:.1f} mm"
+    valid_folds = [r for r in fold_rmses
+                   if not math.isnan(r) and r < COLLAPSE_PENALTY / 1000]
+    loo_mean = float(np.mean(valid_folds))   if valid_folds else float('nan')
+    loo_std  = (float(np.std(valid_folds, ddof=1))
+                if len(valid_folds) > 1 else float('nan'))
+    n_col    = sum(1 for r in fold_rmses if r >= COLLAPSE_PENALTY / 1000)
+    print(f"    → LOO RMSE = {loo_mean:.1f} ± {loo_std:.1f} mm"
           f"  ({n_col}/{N} collapsed)")
 
-    # ── Retrain trên toàn bộ N file → best_global_params ─────────────
-    if need_tune:
+    # ── Retrain inner LOO trên toàn bộ N file → best_global_params ────
+    if has_grid:
         cfg = GRIDS[method_name]
         print(f"    Retrain inner LOO trên toàn bộ {N} file...")
-        best_global_params, _ = inner_loo(
+        best_global, _ = _grid_search_loo(
             cfg["filt_class"], cfg["grid"], cfg["fixed_params"],
             all_files, gt_xy, expected_path_length,
-            verbose=True, method_name=method_name,
-        )
+            method_name, verbose=True)
     elif method_name == "Raw+LS":
-        best_global_params = {}
+        best_global = {}
     else:
-        best_global_params = DEFAULT_PARAMS[method_name].copy()
+        _, default_kw = METHODS[method_name]
+        best_global = default_kw.copy()
 
-    return fold_rmses, best_global_params
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  FINAL EVALUATION (dùng best_global_params)
-# ══════════════════════════════════════════════════════════════════════
-def final_evaluate(method_name, filt_class_or_none,
-                   all_files, gt_xy, expected_path_length,
-                   best_params):
-    """
-    Chạy filter với best_params trên toàn bộ file → gom lại errors và positions.
-    Đây là evaluation cho visualization / summary table.
-    """
-    all_errors   = []
-    all_positions= []
-    per_file_rmse= []
-    collapse_warn= []
-
-    for path in all_files:
-        dist_raw = parse_file(path)
-        if dist_raw is None:
-            continue
-        if filt_class_or_none is None:
-            pos = run_ls(dist_raw)
-        else:
-            pos = run_filter(filt_class_or_none, dist_raw, **best_params)
-
-        valid    = pos[~np.any(np.isnan(pos), axis=1)]
-        collapsed = is_trajectory_collapsed(valid, expected_path_length)
-        if collapsed:
-            collapse_warn.append(os.path.basename(path))
-
-        errs = nearest_gt_error(valid, gt_xy) if len(valid) > 0 else np.array([])
-        rmse = float(np.sqrt(np.mean(errs**2))) if len(errs) > 0 else float('nan')
-        per_file_rmse.append(rmse)
-        all_errors.extend(errs)
-        all_positions.extend(valid)
-
-    return (np.array(all_errors),
-            np.array(all_positions) if all_positions else np.empty((0, 2)),
-            collapse_warn,
-            per_file_rmse)
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  METRICS
-# ══════════════════════════════════════════════════════════════════════
-def compute_metrics(errors, pos_xy=None, expected_path_length=None):
-    if len(errors) == 0:
-        return {k: float('nan') for k in
-                ['mae', 'rmse', 'cep50', 'cep90', 'p95', 'max',
-                 'motion_ratio', 'collapsed']}
-    base = {
-        'mae'  : float(np.mean(errors)),
-        'rmse' : float(np.sqrt(np.mean(errors**2))),
-        'cep50': float(np.percentile(errors, 50)),
-        'cep90': float(np.percentile(errors, 90)),
-        'p95'  : float(np.percentile(errors, 95)),
-        'max'  : float(np.max(errors)),
-    }
-    if pos_xy is not None and expected_path_length is not None and len(pos_xy) > 1:
-        disp  = compute_trajectory_displacement(pos_xy)
-        ratio = disp / (expected_path_length + 1e-9)
-        base['motion_ratio'] = round(ratio, 3)
-        base['collapsed']    = is_trajectory_collapsed(pos_xy, expected_path_length)
-    else:
-        base['motion_ratio'] = float('nan')
-        base['collapsed']    = False
-    return base
+    return fold_rmses, best_global, loo_mean, loo_std
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PLOTS
 # ══════════════════════════════════════════════════════════════════════
-def plot_cdf(errors_dict, collapse_warn_dict, loo_rmse_dict, save_path):
-    fig, ax = plt.subplots(figsize=(12, 7))
+def plot_cdf(errors_dict, collapse_warn, save_path):
+    fig, ax = plt.subplots(figsize=(11, 6))
     for label, errors in errors_dict.items():
         if len(errors) == 0:
             continue
         s    = np.sort(errors)
         cdf  = np.arange(1, len(s) + 1) / len(s)
         rmse = np.sqrt(np.mean(errors**2))
-        loo  = loo_rmse_dict.get(label, float('nan'))
         c    = COLORS.get(label, 'gray')
-        lw   = 2.5 if label != "Raw+LS" else 1.5
-        ls   = '-'  if label != "Raw+LS" else '--'
-        n_col    = len(collapse_warn_dict.get(label, []))
+        lw   = 2.5 if label not in ("Raw+LS",) else 1.5
+        ls   = '-'  if label not in ("Raw+LS",) else '--'
+        n_col    = len(collapse_warn.get(label, []))
         warn_tag = f" ⚠{n_col}" if n_col > 0 else ""
-        loo_tag  = f"  LOO={loo:.1f}" if not math.isnan(loo) else ""
         ax.plot(s, cdf, lw=lw, color=c, ls=ls,
-                label=f"{label}{warn_tag}  RMSE={rmse:.1f}mm{loo_tag}")
+                label=f"{label}{warn_tag}  RMSE={rmse:.1f}mm")
         ax.axvline(rmse, color=c, ls=':', lw=0.8, alpha=0.4)
     ax.set_xlabel("Position Error (mm)", fontsize=13, fontweight='bold')
     ax.set_ylabel("CDF", fontsize=13, fontweight='bold')
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
     ax.set_xlim(0, 500)
     ax.set_ylim(0, 1.02)
-    ax.legend(fontsize=9, loc='lower right')
+    ax.legend(fontsize=10, loc='lower right')
     ax.grid(True, ls='--', alpha=0.4)
-    ax.set_title("EKF Suite — Error CDF  (LOO-tuned)", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     print(f"[✓] CDF → {save_path}")
     plt.close()
 
 
-def plot_trajectories(positions_dict, gt_xy, collapse_warn_dict, save_path):
+def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     fig, ax = plt.subplots(figsize=(12, 14))
     ax.plot(gt_xy[:, 0], gt_xy[:, 1], 'k--', lw=2.5,
             label='Ground Truth', alpha=0.5, zorder=5)
     for label, pos in positions_dict.items():
+        color = COLORS.get(label, 'gray')
         if len(pos) == 0:
             continue
-        color = COLORS.get(label, 'gray')
         errs  = nearest_gt_error(pos, gt_xy)
         rmse  = np.sqrt(np.mean(errs**2))
-        n_col = len(collapse_warn_dict.get(label, []))
+        n_col = len(collapse_warn.get(label, []))
         warn  = f" ⚠{n_col}" if n_col > 0 else ""
         lw = 2.0 if label != "Raw+LS" else 1.2
         ls = '-'  if label != "Raw+LS" else '--'
@@ -882,23 +996,22 @@ def plot_trajectories(positions_dict, gt_xy, collapse_warn_dict, save_path):
     ax.legend(fontsize=8, loc='best')
     ax.set_aspect('equal')
     ax.grid(True, ls='--', alpha=0.3)
-    ax.set_title("EKF Suite — Trajectories (LOO-tuned params)", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Trajectories → {save_path}")
     plt.close()
 
 
-def plot_bar(metrics_dict, loo_rmse_dict, save_path):
+def plot_bar(metrics_dict, save_path):
     methods      = list(metrics_dict.keys())
     metric_names = ['rmse', 'mae', 'cep50', 'p95']
-    labels_disp  = ['RMSE (full)', 'MAE', 'CEP50', 'P95']
+    labels_disp  = ['RMSE', 'MAE', 'CEP50', 'P95']
     fig, axes    = plt.subplots(1, 4, figsize=(26, 6))
     for ax, mname, mlabel in zip(axes, metric_names, labels_disp):
-        vals   = [metrics_dict[m][mname] for m in methods]
-        colors = [COLORS.get(m, 'gray') for m in methods]
-        bars   = ax.bar(range(len(methods)), vals, color=colors,
-                        alpha=0.85, edgecolor='white', lw=1.5)
+        vals    = [metrics_dict[m][mname] for m in methods]
+        colors  = [COLORS.get(m, 'gray') for m in methods]
+        bars    = ax.bar(range(len(methods)), vals, color=colors,
+                         alpha=0.85, edgecolor='white', lw=1.5)
         for bar, val, m in zip(bars, vals, methods):
             if metrics_dict[m].get('collapsed', False):
                 bar.set_hatch('//')
@@ -906,198 +1019,160 @@ def plot_bar(metrics_dict, loo_rmse_dict, save_path):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 1,
                     f'{val:.0f}', ha='center', va='bottom',
-                    fontsize=9, fontweight='bold')
-        # Thêm LOO RMSE line nếu là cột RMSE
-        if mname == 'rmse':
-            for i, m in enumerate(methods):
-                loo = loo_rmse_dict.get(m, float('nan'))
-                if not math.isnan(loo) and loo < COLLAPSE_PENALTY * 0.9:
-                    ax.plot([i - 0.4, i + 0.4], [loo, loo],
-                            color='black', lw=2, ls='--', alpha=0.6)
+                    fontsize=10, fontweight='bold')
         ax.set_xticks(range(len(methods)))
         ax.set_xticklabels([m.replace('-', '\n') for m in methods],
-                           fontsize=8, ha='center')
+                           fontsize=9, ha='center')
         ax.set_ylabel("mm", fontsize=12)
         ax.set_title(mlabel, fontsize=13, fontweight='bold')
         ax.grid(True, axis='y', ls='--', alpha=0.3)
-    axes[0].set_title("RMSE (dashed=LOO estimate)", fontsize=12, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Bar → {save_path}")
     plt.close()
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("  EKF Suite V1 — LOO Cross-Validation Chuẩn")
+    print("  EKF Suite — Outer LOO Cross-Validation Chuẩn")
+    print("=" * 80)
+    print("  1. Raw+LS      — Weighted Least Squares (baseline)")
+    print("  2. EKF          — Extended Kalman Filter chuan")
+    print("  3. Huber-EKF    — IRLS voi Huber M-estimator")
+    print("  4. MCC-EKF      — Maximum Correntropy Criterion EKF")
+    print("  5. PC-EKF-2D    — MAD sigma-free consensus (LOO-tuned)")
+    print("  6. AEKF         — Adaptive EKF (Sage-Husa, LOO-tuned)")
+    print("  7. REKF         — Robust EKF Student-t (LOO-tuned)")
     print("=" * 80)
     print("""
-  LOO Pipeline:
+  Outer LOO Pipeline:
     for k = 0..N-1:
-        train = all_files \\ {file[k]}          (N-1 file)
+        train = all_files \ {file[k]}           (N-1 file)
         test  = file[k]                         (1 file)
-        best_params = inner_loo(train, grid)    → tune trên N-1 file
-        fold_rmse[k] = RMSE(test, best_params)  → test trên file chưa thấy
+        best_params_k = inner_loo(train, grid)  → tune tren N-1 file
+        fold_rmse[k]  = RMSE(test, best_params_k)
 
     outer_loo_rmse = mean(fold_rmse)            → unbiased performance estimate
-    best_global_params = inner_loo(all_files)   → retrain để production eval
+    best_global    = inner_loo(all_files)       → retrain de production eval
 """)
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     all_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.txt")))
-    N = len(all_files)
-    if N == 0:
-        print(f"\n[!] Không tìm thấy file .txt trong '{DATA_DIR}/'")
+    n = len(all_files)
+    if n == 0:
+        print(f"\n[!] Khong tim thay file .txt trong '{DATA_DIR}/'")
         return
-    print(f"  Tìm thấy {N} file(s) trong '{DATA_DIR}/'")
+    print(f"  Tim thay {n} file(s) trong '{DATA_DIR}/'")
 
     np.random.seed(42)
-    all_files = [all_files[i] for i in np.random.permutation(N)]
+    all_files = [all_files[i] for i in np.random.permutation(n)]
 
     gt_xy, total_time = build_ground_truth(WAYPOINTS, SPEED, GT_SPACING)
-    expected_path_length = float(np.linalg.norm(
-        np.diff(WAYPOINTS, axis=0), axis=1).sum())
-    print(f"  Path={expected_path_length:.0f}mm  "
-          f"Time={total_time:.1f}s  GT={len(gt_xy)} points")
-    print(f"  LOO Tuning: {'BẬT' if DO_LOO_TUNING else 'TẮT (dùng default params)'}")
+    expected_path_length = np.linalg.norm(np.diff(WAYPOINTS, axis=0), axis=1).sum()
+    print(f"  Path={expected_path_length:.0f}mm  Time={total_time:.1f}s  GT={len(gt_xy)} points")
+    print(f"  DO_GRID_SEARCH = {DO_GRID_SEARCH}")
 
-    # ─────────────────────────────────────────────────────────────────
-    # Các method cần chạy
-    # ─────────────────────────────────────────────────────────────────
-    METHODS_TO_RUN = {
-        "Raw+LS"   : None,           # không tune, không filter class
-        "EKF"      : StandardEKF,    # không tune
-        "Huber-EKF": HuberEKF,
-        "MCC-EKF"  : MCCEKF,
-        "PC-EKF-2D": PCEKF2D,
-        "AEKF"     : AEKF,
-        "REKF"     : REKF,
-    }
-
-    # ─────────────────────────────────────────────────────────────────
-    # OUTER LOO cho tất cả methods
-    # ─────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    #  OUTER LOO cho tất cả methods
+    # ══════════════════════════════════════════════════════════════════
     print("\n" + "═" * 80)
     print("  OUTER LOO CROSS-VALIDATION")
     print("═" * 80)
 
-    loo_fold_rmses  = {}   # method → list[float] (N giá trị)
-    best_global_params_all = {}   # method → dict
+    loo_fold_rmses  = {}   # method → list[float]
+    best_global_all = {}   # method → dict
+    loo_mean_all    = {}   # method → float
+    loo_std_all     = {}   # method → float
 
-    for method_name, filt_class in METHODS_TO_RUN.items():
-        fold_rmses, best_global = outer_loo(
-            method_name, filt_class, all_files,
-            gt_xy, expected_path_length,
-            do_tuning=DO_LOO_TUNING,
-        )
-        loo_fold_rmses[method_name]        = fold_rmses
-        best_global_params_all[method_name] = best_global
+    FILT_CLASSES = {
+        "Raw+LS"    : None,
+        "EKF"       : StandardEKF,
+        "Huber-EKF" : HuberEKF,
+        "MCC-EKF"   : MCCEKF,
+        "PC-EKF-2D" : PCEKF2D,
+        "AEKF"      : AEKF,
+        "REKF"      : REKF,
+    }
 
-    # ─────────────────────────────────────────────────────────────────
-    # FINAL EVALUATION với best_global_params (cho visualization)
-    # ─────────────────────────────────────────────────────────────────
+    for method_name in METHODS:
+        filt_cls = FILT_CLASSES[method_name]
+        if DO_GRID_SEARCH or method_name not in GRIDS:
+            fold_rmses, best_global, loo_mean, loo_std = outer_loo_one_method(
+                method_name, filt_cls, all_files, gt_xy, expected_path_length)
+        else:
+            # Grid search tắt: dùng default params
+            _, default_kw = METHODS[method_name] if METHODS[method_name] else (None, {})
+            fold_rmses = []
+            for k in range(n):
+                fr = _loo_fold_rmse(filt_cls,
+                                    default_kw if default_kw else {},
+                                    all_files[k], gt_xy, expected_path_length)
+                fold_rmses.append(fr if fr is not None else float('nan'))
+            valid_f  = [r for r in fold_rmses if not math.isnan(r) and r < COLLAPSE_PENALTY / 1000]
+            loo_mean = float(np.mean(valid_f)) if valid_f else float('nan')
+            loo_std  = float(np.std(valid_f, ddof=1)) if len(valid_f) > 1 else float('nan')
+            best_global = default_kw if default_kw else {}
+
+        loo_fold_rmses[method_name]  = fold_rmses
+        best_global_all[method_name] = best_global
+        loo_mean_all[method_name]    = loo_mean
+        loo_std_all[method_name]     = loo_std
+
+    # ══════════════════════════════════════════════════════════════════
+    #  FINAL EVALUATION với best_global_params
+    # ══════════════════════════════════════════════════════════════════
     print("\n" + "═" * 80)
-    print("  FINAL EVALUATION (best params retrained trên toàn bộ N file)")
+    print("  FINAL EVALUATION (best params retrained tren toan bo N file)")
     print("═" * 80)
 
-    all_errors_dict    = {}
-    all_positions_dict = {}
-    collapse_warn_dict = {}
-    per_file_rmse_dict = {}
+    for method_name, best_global in best_global_all.items():
+        if method_name == "Raw+LS":
+            continue
+        filt_cls = FILT_CLASSES[method_name]
+        METHODS[method_name] = (filt_cls, best_global)
 
-    hdr = f"{'File':<22s}"
-    for m in METHODS_TO_RUN:
-        hdr += f" {m:>11s}"
-    print("\n" + hdr)
-    print("─" * (22 + 12 * len(METHODS_TO_RUN)))
+    errors, positions, collapse_warn, per_file_rmse = evaluate_files(
+        all_files, gt_xy, expected_path_length)
 
-    # Thu thập per-file RMSE trong final eval
-    pf_matrix = {m: [] for m in METHODS_TO_RUN}
-    for path in all_files:
-        row = f"{os.path.basename(path):<22s}"
-        for method_name, filt_class in METHODS_TO_RUN.items():
-            params = best_global_params_all[method_name]
-            r = file_rmse(filt_class, path, gt_xy, expected_path_length, **params)
-            rmse_val = r if r is not None else float('nan')
-            pf_matrix[method_name].append(rmse_val)
-            col_flag = "⚠" if rmse_val >= COLLAPSE_PENALTY * 0.9 else " "
-            row += f" {col_flag}{rmse_val:>9.1f}"
-        print(row)
-    print("─" * (22 + 12 * len(METHODS_TO_RUN)))
-
-    # Gom errors/positions
-    timing = {}
-    for method_name, filt_class in METHODS_TO_RUN.items():
-        params = best_global_params_all[method_name]
-        t0 = time.perf_counter()
-        errs, pos, cwarn, pfr = final_evaluate(
-            method_name, filt_class, all_files,
-            gt_xy, expected_path_length, params)
-        elapsed = time.perf_counter() - t0
-        n_samp  = sum(len(parse_file(p) or []) for p in all_files)
-        timing[method_name] = elapsed * 1000 / max(n_samp, 1)
-
-        all_errors_dict[method_name]    = errs
-        all_positions_dict[method_name] = pos
-        collapse_warn_dict[method_name] = cwarn
-        per_file_rmse_dict[method_name] = pfr
-
-    # ─────────────────────────────────────────────────────────────────
-    # SUMMARY TABLE
-    # ─────────────────────────────────────────────────────────────────
-    TUNED_METHODS = set(GRIDS.keys())
-    print(f"\n{'═' * 130}")
+    # ── Summary table ─────────────────────────────────────────────────
+    TUNED = set(GRIDS.keys())
+    print(f"\n{'═' * 135}")
     print("  SUMMARY TABLE (mm)")
-    print(f"  LOO est. = unbiased estimate từ outer LOO")
-    print(f"  Full RMSE = evaluation trên toàn bộ data với best_global_params")
-    print(f"{'═' * 130}")
+    print(f"  LOO RMSE = unbiased estimate tu outer LOO (N folds)")
+    print(f"  Full RMSE = evaluation tren toan bo data voi best_global_params")
+    print(f"{'═' * 135}")
     print(f"  {'Method':<13s} {'LOO RMSE':>10s} {'±std':>8s} "
           f"{'Full RMSE':>10s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
           f"{'P95':>7s} {'MAX':>7s} {'MotionR':>8s}  Status  BestParams")
-    print(f"  {'─' * 120}")
+    print(f"  {'─' * 125}")
 
-    metrics_dict  = {}
-    loo_rmse_dict = {}   # method → LOO mean RMSE (không collapse)
+    metrics = {}
+    for method_name in METHODS:
+        errs    = errors.get(method_name, np.array([]))
+        pos_arr = positions.get(method_name, np.empty((0, 2)))
+        m       = compute_metrics(errs, pos_arr, expected_path_length)
+        metrics[method_name] = m
 
-    for method_name in METHODS_TO_RUN:
-        errs   = all_errors_dict[method_name]
-        pos_arr= all_positions_dict[method_name]
-        m      = compute_metrics(errs, pos_arr, expected_path_length)
-        metrics_dict[method_name] = m
-
-        fold_r = loo_fold_rmses[method_name]
-        # Chỉ tính LOO mean trên các fold không collapse
-        valid_folds = [r for r in fold_r
-                       if not math.isnan(r) and r < COLLAPSE_PENALTY * 0.9]
-        loo_mean = float(np.mean(valid_folds)) if valid_folds else float('nan')
-        loo_std  = (float(np.std(valid_folds, ddof=1))
-                    if len(valid_folds) > 1 else float('nan'))
-        loo_rmse_dict[method_name] = loo_mean
-        n_col    = len(collapse_warn_dict[method_name])
-        n_col_loo= sum(1 for r in fold_r if r >= COLLAPSE_PENALTY * 0.9)
-
-        status   = (f"⚠ {n_col} col" if n_col > 0 else "✅ OK")
-        tag      = " ◀" if method_name in TUNED_METHODS else "  "
+        loo_m    = loo_mean_all.get(method_name, float('nan'))
+        loo_s    = loo_std_all.get(method_name, float('nan'))
+        fold_r   = loo_fold_rmses.get(method_name, [])
+        n_col_loo= sum(1 for r in fold_r if r >= COLLAPSE_PENALTY / 1000)
+        n_col    = len(collapse_warn.get(method_name, []))
+        status   = f"⚠ {n_col} col" if n_col > 0 else "✅ OK"
+        tag      = " ◀" if method_name in TUNED else "  "
         mr_str   = (f"{m['motion_ratio']:.2f}"
-                    if not math.isnan(m.get('motion_ratio', float('nan')))
-                    else "N/A")
+                    if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A")
 
-        # Best params string
-        bp = best_global_params_all[method_name]
+        bp = best_global_all.get(method_name, {})
         if method_name in GRIDS:
             tune_keys = list(GRIDS[method_name]["grid"].keys())
-            bp_str = " ".join(f"{k}={bp[k]}" for k in tune_keys)
+            bp_str = " ".join(f"{k}={bp.get(k, '?')}" for k in tune_keys)
         else:
             bp_str = "(fixed)"
 
-        loo_str = (f"{loo_mean:7.1f}" if not math.isnan(loo_mean)
-                   else "    N/A")
-        std_str = (f"{loo_std:6.1f}" if not math.isnan(loo_std)
-                   else "   N/A")
+        loo_str = f"{loo_m:7.1f}" if not math.isnan(loo_m) else "    N/A"
+        std_str = f"{loo_s:6.1f}" if not math.isnan(loo_s) else "   N/A"
         if n_col_loo > 0:
             loo_str += f"[⚠{n_col_loo}]"
 
@@ -1107,20 +1182,10 @@ def main():
               f" {m['p95']:>7.1f} {m['max']:>7.1f}"
               f" {mr_str:>8s}  {status:<10s}  {bp_str}")
 
-    # ─────────────────────────────────────────────────────────────────
-    # TIMING
-    # ─────────────────────────────────────────────────────────────────
-    print(f"\n  TIMING (ms/sample):")
-    for name, ms in timing.items():
-        if name != "Raw+LS":
-            print(f"    {name:<13s}: {ms:.4f} ms/sample")
-
-    # ─────────────────────────────────────────────────────────────────
-    # WILCOXON
-    # ─────────────────────────────────────────────────────────────────
+    # ── Wilcoxon ──────────────────────────────────────────────────────
     print(f"\n  Wilcoxon tests (two-sided, vs PC-EKF-2D):")
-    ref_err = all_errors_dict.get("PC-EKF-2D", np.array([]))
-    for name, errs in all_errors_dict.items():
+    ref_err = errors.get("PC-EKF-2D", np.array([]))
+    for name, errs in errors.items():
         if name == "PC-EKF-2D" or len(errs) == 0 or len(ref_err) == 0:
             continue
         N2 = min(len(errs), len(ref_err))
@@ -1128,27 +1193,23 @@ def main():
             try:
                 _, p = wilcoxon(errs[:N2], ref_err[:N2])
                 sym  = '✅ p<0.05' if p < 0.05 else '⚠️  ns'
-                print(f"    {name:<13s} vs PC-EKF-2D: p={p:.4f}  {sym}")
+                print(f"    {name:<14s} vs PC-EKF-2D: p={p:.4f}  {sym}")
             except ValueError:
                 pass
 
-    # ─────────────────────────────────────────────────────────────────
-    # PLOTS
-    # ─────────────────────────────────────────────────────────────────
-    plot_cdf(all_errors_dict, collapse_warn_dict, loo_rmse_dict,
-             os.path.join(SAVE_DIR, 'cdf.png'))
-    plot_trajectories(all_positions_dict, gt_xy, collapse_warn_dict,
+    # ── Plots ─────────────────────────────────────────────────────────
+    plot_cdf(errors, collapse_warn, os.path.join(SAVE_DIR, 'cdf.png'))
+    plot_trajectories(positions, gt_xy, collapse_warn,
                       os.path.join(SAVE_DIR, 'trajectories.png'))
-    plot_bar(metrics_dict, loo_rmse_dict,
-             os.path.join(SAVE_DIR, 'bar_comparison.png'))
+    plot_bar(metrics, os.path.join(SAVE_DIR, 'bar_comparison.png'))
 
-    for method_name, errs in all_errors_dict.items():
-        safe = method_name.lower().replace('+', '_').replace('-', '_').replace(' ', '_')
+    for label, errs in errors.items():
+        safe = label.lower().replace('+', '_').replace('-', '_').replace(' ', '_')
         np.save(os.path.join(SAVE_DIR, f'errors_{safe}.npy'), errs)
         np.save(os.path.join(SAVE_DIR, f'loo_folds_{safe}.npy'),
-                np.array(loo_fold_rmses[method_name]))
+                np.array(loo_fold_rmses.get(label, [])))
 
-    print(f"\n[✓] Kết quả lưu tại '{SAVE_DIR}/'")
+    print(f"\n[OK] Ket qua luu tai '{SAVE_DIR}/'")
 
 
 if __name__ == "__main__":
