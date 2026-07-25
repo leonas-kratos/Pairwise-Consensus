@@ -12,7 +12,7 @@ CÁC PHƯƠNG PHÁP:
 
 THAY ĐỔI SO VỚI V20:
   - TẤT CẢ filter có params đều dùng LOO cross-validation để tuning:
-      Huber-UKF, MCC-UKF, GUKF, PC-UKF-2D → _grid_search_loo() chung
+      Huber-UKF, MCC-UKF, GUKF, PC-UKF-2D → _grid_search() chung
   - Xoá _eval_rmse_single() (dùng toàn eval set, không công bằng)
   - Thêm: in ra console ngay khi tìm được best mới (RMSE + hệ số)
   - grid_search_pcukf_loo() → gọi hàm chung (bỏ code riêng)
@@ -20,7 +20,7 @@ THAY ĐỔI SO VỚI V20:
 
 CÔNG BẰNG TUNING:
   - Raw+LS, UKF: không có param cần tune → không cần LOO
-  - Huber-UKF, MCC-UKF, GUKF, PC-UKF-2D: đều dùng _grid_search_loo()
+  - Huber-UKF, MCC-UKF, GUKF, PC-UKF-2D: đều dùng _grid_search()
     → mỗi fold: params được chọn từ (N-1) files, validate trên 1 file còn lại
     → không có method nào được "nhìn thấy" eval file khi chọn params
 
@@ -749,85 +749,86 @@ def _loo_fold_rmse(filt_class, kwargs, val_file, gt_xy, expected_path_length):
     return float(np.sqrt(np.mean(errs**2)))
 
 
-def _grid_search_loo(filt_class, grid, fixed_params,
-                     tune_files, gt_xy, expected_path_length,
-                     method_name, verbose=True):
+def _grid_search(filt_class, grid, fixed_params,
+                 train_files, gt_xy, expected_path_length,
+                 method_name, verbose=True):
     """
-    Inner LOO: duyệt grid, với mỗi combo tính LOO-RMSE trên tune_files.
-    verbose=False → im lặng (dùng khi gọi từ outer LOO).
-    Trả về (best_params, best_loo_rmse).
+    Grid search: với mỗi combo tham số, tính mean RMSE trên TOÀN BỘ train_files.
+    Không phải LOO bên trong train_files — dùng luôn cả tập train để đánh giá.
+    verbose=False → im lặng.
+    Trả về (best_params, best_mean_rmse).
     """
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
-    n      = len(tune_files)
+    n      = len(train_files)
 
     if verbose:
-        print(f"\n    Inner LOO [{method_name}]: "
-              f"{len(combos)} combos × {n} folds = {len(combos) * n} runs")
-        print(f"    {'LOO-RMSE':>10s}  Params")
-        print(f"    {'─' * 53}")
+        print(f"\n    Grid search [{method_name}]: "
+              f"{len(combos)} combos x {n} train files = {len(combos) * n} runs")
+        print(f"    {'Mean-RMSE':>10s}  Params")
+        print(f"    {chr(0x2500) * 53}")
 
-    best_loo_rmse = float('inf')
-    best_params   = {**fixed_params}
+    best_mean_rmse = float('inf')
+    best_params    = {**fixed_params}
 
     for combo in combos:
         params = {**fixed_params, **dict(zip(keys, combo))}
-        fold_rmses = []
-        for val_file in tune_files:
-            fr = _loo_fold_rmse(filt_class, params, val_file,
+        rmses  = []
+        for f in train_files:
+            fr = _loo_fold_rmse(filt_class, params, f,
                                 gt_xy, expected_path_length)
             if fr is not None:
-                fold_rmses.append(fr)
-        if not fold_rmses:
+                rmses.append(fr)
+        if not rmses:
             continue
-        loo_rmse = float(np.mean(fold_rmses))
-        if loo_rmse < best_loo_rmse:
-            best_loo_rmse = loo_rmse
-            best_params   = params.copy()
+        mean_rmse = float(np.mean(rmses))
+        if mean_rmse < best_mean_rmse:
+            best_mean_rmse = mean_rmse
+            best_params    = params.copy()
             if verbose:
-                tag       = " ⚠COLLAPSED" if loo_rmse >= COLLAPSE_PENALTY / 1000 else ""
+                tag       = " ⚠COLLAPSED" if mean_rmse >= COLLAPSE_PENALTY / 1000 else ""
                 param_str = "  ".join(f"{k}={params[k]}" for k in keys)
-                print(f"    ★ {loo_rmse:8.2f}mm{tag:<12s}  {param_str}")
+                print(f"    ★ {mean_rmse:8.2f}mm{tag:<12s}  {param_str}")
 
     if verbose:
-        print(f"    {'─' * 53}")
+        print(f"    {chr(0x2500) * 53}")
         best_param_str = "  ".join(f"{k}={best_params[k]}" for k in keys)
-        print(f"    ✔ Best: {best_loo_rmse:.2f}mm  |  {best_param_str}")
-    return best_params, best_loo_rmse
+        print(f"    ✔ Best: {best_mean_rmse:.2f}mm  |  {best_param_str}")
+    return best_params, best_mean_rmse
 
 
 def outer_loo_one_method(method_name, filt_class_or_none,
                           all_files, gt_xy, expected_path_length):
-    """
-    Outer LOO chuẩn cho 1 method:
+    r"""
+    Outer LOO cho 1 method:
 
       for k = 0..N-1:
-          train = all_files \ {file[k]}           (N-1 file)
-          best_params_k = inner_loo(train, grid)   → không nhìn thấy file[k]
-          fold_rmse[k]  = RMSE(file[k], best_params_k)
+          train_files = all_files - {file[k]}    (N-1 file)
+          best_params_k = grid_search(train_files) -> tune tren N-1 file, khong thay file[k]
+          fold_rmse[k]  = RMSE(file[k], best_params_k) -> test file CHUA TUNG THAY
 
-      outer_loo_rmse = mean(fold_rmse)             → unbiased estimate
+      loo_rmse = mean(fold_rmse)   -> unbiased estimate
 
-      Retrain: inner_loo(all N files) → best_global_params  (để production eval)
+      Retrain: grid_search(all N files) -> best_global_params (cho final eval)
 
-    Returns: (fold_rmses, best_global_params)
+    Returns: (fold_rmses, best_global_params, loo_mean, loo_std)
     """
-    N         = len(all_files)
-    has_grid  = method_name in GRIDS
+    N        = len(all_files)
+    has_grid = method_name in GRIDS
     fold_rmses  = []
     fold_params = []
 
-    print(f"\n  ── Outer LOO: {method_name}  (N={N} folds) ──")
+    print(f"\n  {chr(0x2500)*2} Outer LOO: {method_name}  (N={N} folds) {chr(0x2500)*2}")
 
     for k in range(N):
         test_file   = all_files[k]
         train_files = [f for i, f in enumerate(all_files) if i != k]
         fname       = os.path.basename(test_file)
 
-        # ── Inner LOO trên N-1 files (im lặng) ────────────────────────
+        # ── Grid search trên N-1 train files (im lặng) ────────────────
         if has_grid:
             cfg = GRIDS[method_name]
-            best_k, _ = _grid_search_loo(
+            best_k, _ = _grid_search(
                 cfg["filt_class"], cfg["grid"], cfg["fixed_params"],
                 train_files, gt_xy, expected_path_length,
                 method_name, verbose=False)
@@ -838,7 +839,7 @@ def outer_loo_one_method(method_name, filt_class_or_none,
             _, default_kw = METHODS[method_name]
             best_k = default_kw.copy()
 
-        # ── Test trên fold k ───────────────────────────────────────────
+        # ── Test trên file chưa từng thấy ────────────────────────────
         fr = _loo_fold_rmse(filt_class_or_none, best_k, test_file,
                             gt_xy, expected_path_length)
         fr = fr if fr is not None else float('nan')
@@ -862,14 +863,14 @@ def outer_loo_one_method(method_name, filt_class_or_none,
     loo_std  = (float(np.std(valid_folds, ddof=1))
                 if len(valid_folds) > 1 else float('nan'))
     n_col    = sum(1 for r in fold_rmses if r >= COLLAPSE_PENALTY / 1000)
-    print(f"    → LOO RMSE = {loo_mean:.1f} ± {loo_std:.1f} mm"
+    print(f"    -> LOO RMSE = {loo_mean:.1f} +/- {loo_std:.1f} mm"
           f"  ({n_col}/{N} collapsed)")
 
-    # ── Retrain inner LOO trên toàn bộ N file → best_global_params ────
+    # ── Retrain grid search trên toàn bộ N file → best_global_params ───
     if has_grid:
         cfg = GRIDS[method_name]
-        print(f"    Retrain inner LOO trên toàn bộ {N} file...")
-        best_global, _ = _grid_search_loo(
+        print(f"    Grid search retrain tren toan bo {N} file...")
+        best_global, _ = _grid_search(
             cfg["filt_class"], cfg["grid"], cfg["fixed_params"],
             all_files, gt_xy, expected_path_length,
             method_name, verbose=True)
