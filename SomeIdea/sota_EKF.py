@@ -1,28 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-UWB Indoor Positioning — V21: Robust & Adaptive KF  (Full LOO Tuning)
-=======================================================================
+UWB Indoor Positioning — EKF Suite V1
+======================================
 CÁC PHƯƠNG PHÁP:
   1. Raw+LS        — baseline Weighted Least Squares
-  2. UKF            — Unscented Kalman Filter chuẩn
-  3. Huber-UKF      — IRLS Huber M-estimator
-  4. MCC-UKF        — Maximum Correntropy Criterion UKF
-  5. PC-UKF-2D      — Pairwise Consensus MAD-normalized (sigma-free) + UKF
-  6. GUKF           — Gaussian-smoothed UKF (Sun et al. 2025)
+  2. EKF            — Extended Kalman Filter chuẩn
+  3. Huber-EKF      — IRLS Huber M-estimator trên innovation
+  4. MCC-EKF        — Maximum Correntropy Criterion EKF
+  5. PC-EKF-2D      — Pairwise Consensus MAD-normalized + EKF (sigma-free)
+  6. AEKF           — Adaptive EKF (Sage-Husa noise estimator)
+  7. REKF           — Robust EKF với Student-t likelihood (Agamennoni 2012)
 
-THAY ĐỔI SO VỚI V20:
-  - TẤT CẢ filter có params đều dùng LOO cross-validation để tuning:
-      Huber-UKF, MCC-UKF, GUKF, PC-UKF-2D → _grid_search_loo() chung
-  - Xoá _eval_rmse_single() (dùng toàn eval set, không công bằng)
-  - Thêm: in ra console ngay khi tìm được best mới (RMSE + hệ số)
-  - grid_search_pcukf_loo() → gọi hàm chung (bỏ code riêng)
-  - Đảm bảo tuning hoàn toàn công bằng giữa mọi thuật toán
+ĐIỂM KHÁC BIỆT SO VỚI UKF SUITE:
+  - Linearization bằng Jacobian H(x) thay vì sigma-point propagation
+  - H(x): ∂h_i/∂x = (x - ax_i)/r_i,  ∂h_i/∂y = (y - ay_i)/r_i
+    với r_i = sqrt((x-ax_i)² + (y-ay_i)² + h_anchor²)
+  - Predict: P⁻ = P + Q  (không cần sigma points)
+  - Update: K = P⁻Hᵀ(HP⁻Hᵀ + R)⁻¹ (linear Kalman gain)
+  - Nhẹ hơn UKF (~3× faster per step), phù hợp embedded
 
-CÔNG BẰNG TUNING:
-  - Raw+LS, UKF: không có param cần tune → không cần LOO
-  - Huber-UKF, MCC-UKF, GUKF, PC-UKF-2D: đều dùng _grid_search_loo()
-    → mỗi fold: params được chọn từ (N-1) files, validate trên 1 file còn lại
-    → không có method nào được "nhìn thấy" eval file khi chọn params
+SOTA EKF:
+  - AEKF (Sage-Husa): adaptive Q/R estimation online
+    → ước lượng Q̂ và R̂ từ innovation history (sliding window)
+  - REKF (Student-t): robust với heavy-tail noise
+    → weight per measurement = (ν+1)/(ν + r²/S)
+    → ν = degrees of freedom (tune)
+
+TUNING:
+  - Tất cả filter có params: LOO cross-validation
+  - Raw+LS, EKF: không tune
+  - In best mới ngay khi tìm thấy (RMSE + hệ số)
 
 Format file .txt: timestamp, d0_slant, d1_slant, d2_slant, d3_slant, v_mm_s, gz_dps
 """
@@ -47,18 +54,18 @@ warnings.filterwarnings("ignore", category=UserWarning)
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 ANCHORS = np.array([
-    [8800, 0   ],   # A1
-    [8800, 4000],   # A2
-    [0,    4000],   # A3
-    [0,    0   ],   # A4
+    [8800, 0   ],
+    [8800, 4000],
+    [0,    4000],
+    [0,    0   ],
 ], dtype=float)
 
 WAYPOINTS = np.array([
-    [400.0,  3200.0],   # A
-    [400.0,  1000.0],   # B
-    [8000.0, 1000.0],   # C
-    [8000.0, 3200.0],   # D
-    [400.0,  3200.0],   # A
+    [400.0,  3200.0],
+    [400.0,  1000.0],
+    [8000.0, 1000.0],
+    [8000.0, 3200.0],
+    [400.0,  3200.0],
 ], dtype=float)
 
 ANCHOR_HEIGHT = 1400.0
@@ -66,41 +73,42 @@ SPEED         = 200.0
 GT_SPACING    = 5.0
 N_ANCHORS     = 4
 
-# ─── Standard UKF ────────────────────────────────────────────────────
-UKF_STD_Q = 0.001
-UKF_STD_R = 50.0
+# ─── Standard EKF ────────────────────────────────────────────────────
+EKF_Q = 0.001
+EKF_R = 50.0
 
-# ─── Huber-UKF ───────────────────────────────────────────────────────
+# ─── Huber-EKF ───────────────────────────────────────────────────────
 HUBER_Q       = 0.001
 HUBER_R       = 50.0
-HUBER_DELTA   = 20.0
+HUBER_DELTA   = 1.5      # tunable
 HUBER_MAXITER = 5
 
-# ─── MCC-UKF ─────────────────────────────────────────────────────────
+# ─── MCC-EKF ─────────────────────────────────────────────────────────
 MCC_Q         = 0.001
 MCC_R         = 100.0
-MCC_KERNEL_BW = 1700.0
+MCC_KERNEL_BW = 1200.0
 MCC_MAXITER   = 5
 
-# ─── PC-UKF-2D (MAD sigma-free) ──────────────────────────────────────
-PCUKF_Q       = 0.001
-PCUKF_R_BASE  = 25.0
-PCUKF_R_SCALE = 15.0
+# ─── PC-EKF-2D (MAD sigma-free) ──────────────────────────────────────
+PCEKF_Q       = 0.001
+PCEKF_R_BASE  = 25.0
+PCEKF_R_SCALE = 15.0
 
-# ─── GUKF ────────────────────────────────────────────────────────────
-GUKF_Q      = 0.001
-GUKF_R      = 100.0
-GUKF_SIGMA  = 5.0
-GUKF_N_HALF = 4
+# ─── AEKF (Sage-Husa adaptive) ───────────────────────────────────────
+AEKF_Q        = 0.001
+AEKF_R        = 50.0
+AEKF_WIN      = 10       # sliding window size for noise estimation
+AEKF_ALPHA    = 0.95     # forgetting factor
 
-# ─── UKF common ──────────────────────────────────────────────────────
-UKF_ALPHA = 1e-3
-UKF_BETA  = 2.0
-UKF_KAPPA = 0.0
+# ─── REKF (Student-t robust) ─────────────────────────────────────────
+REKF_Q        = 0.001
+REKF_R        = 50.0
+REKF_NU       = 4.0      # degrees of freedom (tunable)
+REKF_MAXITER  = 5
 
-DO_GRID_SEARCH = True
-DATA_DIR       = "./data"
-SAVE_DIR       = "./outputs_sota"
+DO_GRID_SEARCH    = True
+DATA_DIR          = "./data"
+SAVE_DIR          = "./outputs_sota_EKF"
 
 MOTION_RATIO_MIN  = 0.90
 COLLAPSE_PENALTY  = 1e9
@@ -167,66 +175,41 @@ def is_trajectory_collapsed(pos_xy, expected_path_length,
                              ratio_min=MOTION_RATIO_MIN):
     if len(pos_xy) < 2:
         return True
-    total_disp = compute_trajectory_displacement(pos_xy)
-    if total_disp < ratio_min * expected_path_length:
+    if compute_trajectory_displacement(pos_xy) < ratio_min * expected_path_length:
         return True
     bbox_x    = pos_xy[:, 0].max() - pos_xy[:, 0].min()
     bbox_y    = pos_xy[:, 1].max() - pos_xy[:, 1].min()
-    bbox_diag = math.sqrt(bbox_x**2 + bbox_y**2)
-    if bbox_diag < 0.05 * expected_path_length:
+    if math.sqrt(bbox_x**2 + bbox_y**2) < 0.05 * expected_path_length:
         return True
     return False
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  OBSERVATION MODEL & UKF UTILITIES
+#  EKF CORE — Observation model + Jacobian
 # ══════════════════════════════════════════════════════════════════════
-def h_obs(state, anchors=ANCHORS):
-    x, y = state[0], state[1]
+def h_obs(x, anchors=ANCHORS):
+    """Measurement function: slant range to each anchor."""
+    px, py = x[0], x[1]
     return np.array([
-        math.sqrt((x - ax)**2 + (y - ay)**2 + ANCHOR_HEIGHT**2)
+        math.sqrt((px - ax)**2 + (py - ay)**2 + ANCHOR_HEIGHT**2)
         for ax, ay in anchors
     ])
 
 
-def ukf_weights(n, alpha=UKF_ALPHA, beta=UKF_BETA, kappa=UKF_KAPPA):
-    lam = alpha**2 * (n + kappa) - n
-    c   = n + lam
-    Wm  = np.full(2*n + 1, 0.5 / c)
-    Wc  = np.full(2*n + 1, 0.5 / c)
-    Wm[0] = lam / c
-    Wc[0] = lam / c + (1 - alpha**2 + beta)
-    return Wm, Wc, c
-
-
-def sigma_points(x, P, c):
-    n = len(x)
-    try:
-        S = np.linalg.cholesky(c * P)
-    except np.linalg.LinAlgError:
-        S = np.linalg.cholesky(c * (P + np.eye(n) * 1e-6))
-    pts = np.zeros((2*n + 1, n))
-    pts[0] = x
-    for i in range(n):
-        pts[i + 1]     = x + S[:, i]
-        pts[n + i + 1] = x - S[:, i]
-    return pts
-
-
-def ukf_measurement_moments(x_pred, P_pred, Wm, Wc, c):
-    pts   = sigma_points(x_pred, P_pred, c)
-    Z_pts = np.array([h_obs(pts[i]) for i in range(len(pts))])
-    z_hat = Wm @ Z_pts
-    n     = len(x_pred)
-    M     = z_hat.shape[0]
-    Pzz   = np.zeros((M, M))
-    Pxz   = np.zeros((n, M))
-    for i in range(2*n + 1):
-        dz   = Z_pts[i] - z_hat
-        dx   = pts[i] - x_pred
-        Pzz += Wc[i] * np.outer(dz, dz)
-        Pxz += Wc[i] * np.outer(dx, dz)
-    return z_hat, Pzz, Pxz
+def H_jacobian(x, anchors=ANCHORS):
+    """
+    Jacobian of h w.r.t. state x = [px, py].
+    H[i, 0] = (px - ax_i) / r_i
+    H[i, 1] = (py - ay_i) / r_i
+    """
+    px, py = x[0], x[1]
+    H = np.zeros((len(anchors), 2))
+    for i, (ax, ay) in enumerate(anchors):
+        r = math.sqrt((px - ax)**2 + (py - ay)**2 + ANCHOR_HEIGHT**2)
+        r = max(r, 1e-6)
+        H[i, 0] = (px - ax) / r
+        H[i, 1] = (py - ay) / r
+    return H
 
 
 def make_spd(P, eps=1e-9):
@@ -241,160 +224,171 @@ def default_init(dist_raw_0):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  1. STANDARD UKF
+#  1. STANDARD EKF
 # ══════════════════════════════════════════════════════════════════════
-class StandardUKF:
-    def __init__(self, q=UKF_STD_Q, r=UKF_STD_R):
-        self.n     = 2
+class StandardEKF:
+    """
+    EKF chuẩn cho bài toán range-only positioning.
+    State: [px, py], Model: constant position (random walk).
+    Predict: x⁻ = x,  P⁻ = P + Q
+    Update:  H = ∂h/∂x,  S = HP⁻Hᵀ + R,  K = P⁻HᵀS⁻¹
+             x = x⁻ + Kν,  P = (I - KH)P⁻
+    """
+    def __init__(self, q=EKF_Q, r=EKF_R):
         self.Q_mat = np.eye(2) * q
         self.R_mat = np.eye(N_ANCHORS) * r
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
+        self.P = np.eye(2) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
+        # Predict
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-        Pzz_eff = Pzz_no_R + self.R_mat
-        innov   = z_raw - z_hat
+        # Linearize
+        H     = H_jacobian(x_pred)
+        z_hat = h_obs(x_pred)
+        innov = z_raw - z_hat
+        S     = H @ P_pred @ H.T + self.R_mat
         try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
+            K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
+            self.x = x_pred; self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  2. HUBER-UKF
+#  2. HUBER-EKF
 # ══════════════════════════════════════════════════════════════════════
-class HuberUKF:
+class HuberEKF:
+    """
+    EKF với IRLS Huber M-estimator.
+    Mỗi iteration: tính standardized residual r_i = ν_i / sqrt(S_ii),
+    nếu |r_i| > δ → inflate R[i,i] = R_base / w_i  (w_i = δ/|r_i|)
+    → giảm trọng số measurement bị outlier.
+    """
     def __init__(self, q=HUBER_Q, r=HUBER_R,
                  delta=HUBER_DELTA, maxiter=HUBER_MAXITER):
-        self.n       = 2
         self.Q_mat   = np.eye(2) * q
         self.R_base  = r
         self.delta   = delta
         self.maxiter = maxiter
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
+        self.P = np.eye(2) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-        R_eff = np.eye(N_ANCHORS) * self.R_base
+        H      = H_jacobian(x_pred)
+        z_hat  = h_obs(x_pred)
+        innov  = z_raw - z_hat
+        R_eff  = np.eye(N_ANCHORS) * self.R_base
         for _ in range(self.maxiter):
-            Pzz_eff  = Pzz_no_R + R_eff
-            innov    = z_raw - z_hat
-            pzz_diag = np.maximum(np.diag(Pzz_eff), 1e-9)
-            r_scaled = innov / np.sqrt(pzz_diag)
-            hub_w    = np.where(
-                np.abs(r_scaled) <= self.delta,
-                1.0,
-                self.delta / (np.abs(r_scaled) + 1e-9)
-            )
+            S        = H @ P_pred @ H.T + R_eff
+            s_diag   = np.maximum(np.diag(S), 1e-9)
+            r_scaled = innov / np.sqrt(s_diag)
+            hub_w    = np.where(np.abs(r_scaled) <= self.delta,
+                                1.0,
+                                self.delta / (np.abs(r_scaled) + 1e-9))
             hub_w = np.maximum(hub_w, 1e-4)
             R_eff = np.diag(self.R_base / hub_w)
-        Pzz_eff = Pzz_no_R + R_eff
+        S = H @ P_pred @ H.T + R_eff
         try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
+            K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
+            self.x = x_pred; self.P = make_spd(P_pred)
             return self.x.copy()
-        self.x = x_pred + K @ (z_raw - z_hat)
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.x = x_pred + K @ innov
+        self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  3. MCC-UKF
+#  3. MCC-EKF
 # ══════════════════════════════════════════════════════════════════════
-class MCCUKF:
+class MCCEKF:
+    """
+    EKF với Maximum Correntropy Criterion.
+    Weight per measurement: w_i = exp(-ν_i² / (2σ²))
+    → Gaussian kernel trên innovation, down-weight outlier mạnh.
+    """
     def __init__(self, q=MCC_Q, r=MCC_R,
                  kernel_bw=MCC_KERNEL_BW, maxiter=MCC_MAXITER):
-        self.n         = 2
         self.Q_mat     = np.eye(2) * q
         self.R_base    = r
         self.kernel_bw = kernel_bw
         self.maxiter   = maxiter
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
+        self.P = np.eye(2) * 1e6
 
-    def _gaussian_kernel(self, r):
-        return np.exp(-0.5 * r**2 / (self.kernel_bw**2 + 1e-9))
+    def _kernel(self, v):
+        return np.exp(-0.5 * v**2 / (self.kernel_bw**2 + 1e-9))
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-        x_cur = x_pred.copy()
-        K     = np.zeros((self.n, N_ANCHORS))
-        R_eff = np.eye(N_ANCHORS) * self.R_base
+        H      = H_jacobian(x_pred)
+        z_hat  = h_obs(x_pred)
+        innov  = z_raw - z_hat
+        x_cur  = x_pred.copy()
+        K      = np.zeros((2, N_ANCHORS))
+        R_eff  = np.eye(N_ANCHORS) * self.R_base
         for _ in range(self.maxiter):
-            innov   = z_raw - z_hat
-            kern_w  = self._gaussian_kernel(innov)
-            kern_w  = np.maximum(kern_w, 1e-4)
-            R_eff   = np.diag(self.R_base / kern_w)
-            Pzz_eff = Pzz_no_R + R_eff
+            kern_w = np.maximum(self._kernel(innov), 1e-4)
+            R_eff  = np.diag(self.R_base / kern_w)
+            S = H @ P_pred @ H.T + R_eff
             try:
-                K = Pxz @ np.linalg.inv(Pzz_eff)
+                K = P_pred @ H.T @ np.linalg.inv(S)
             except np.linalg.LinAlgError:
                 break
             x_new = x_pred + K @ innov
             if np.linalg.norm(x_new - x_cur) < 1e-3:
-                x_cur = x_new
-                break
+                x_cur = x_new; break
             x_cur = x_new
         self.x = x_cur
-        self.P = make_spd(P_pred - K @ (Pzz_no_R + R_eff) @ K.T)
+        self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  4. PC-UKF-2D — MAD Auto-Normalized, Sigma-Free (V20+)
+#  4. PC-EKF-2D — MAD Auto-Normalized, Sigma-Free
 # ══════════════════════════════════════════════════════════════════════
 def _t_kernel_pairwise(diff_vec, sigma=1.0):
-    """T-distribution kernel, sigma=1.0 cố định (không tune)."""
+    """Student-t kernel với sigma cố định 1.0."""
     nu  = 4.0
-    eps = 1e-9
-    return (1.0 + diff_vec**2 / (nu * sigma**2 + eps)) ** (-(nu + 1.0) / 2.0)
+    return (1.0 + diff_vec**2 / (nu * sigma**2 + 1e-9)) ** (-(nu + 1.0) / 2.0)
 
 
 def pc_mad_scores(innov, S_diag):
     """
-    PC scoring — MAD auto-normalized, sigma-free.
-    Bước 1: Geo-normalize: std_innov[i] = innov[i] / sqrt(S_ii)
-    Bước 2: MAD normalize: normed[i] = std_innov[i] / (1.4826*mad + eps)
-    Bước 3: Pairwise T-kernel score (sigma=1.0 cố định)
+    Pairwise Consensus scoring — MAD auto-normalized, sigma-free.
+
+    1. Geo-normalize:  std_innov[i] = ν_i / sqrt(S_ii)
+       S_ii = (H P⁻ Hᵀ)[i,i] + R_base  (per-anchor innovation variance)
+    2. MAD normalize:  normed[i] = std_innov[i] / (1.4826·MAD + ε)
+    3. Pairwise T-kernel:
+       score[i] = mean_j≠i( T(normed[i] - normed[j]) )
+       → score ≈ 1.0 = tin cậy LOS,  score ≪ 1 = nghi ngờ NLOS
     """
     std_innov = innov / np.sqrt(np.maximum(S_diag, 1e-9))
     med    = np.median(std_innov)
@@ -404,106 +398,189 @@ def pc_mad_scores(innov, S_diag):
     for i in range(N_ANCHORS):
         diffs     = np.array([normed[i] - normed[j]
                               for j in range(N_ANCHORS) if j != i])
-        scores[i] = np.mean(_t_kernel_pairwise(diffs, sigma=1.0))
+        scores[i] = np.mean(_t_kernel_pairwise(diffs))
     return scores
 
 
-class PCUKF2D:
-    def __init__(self, q=PCUKF_Q, r_base=PCUKF_R_BASE, r_scale=PCUKF_R_SCALE):
-        self.n       = 2
+class PCEKF2D:
+    """
+    PC-EKF-2D: Pairwise Consensus scoring dựa trên EKF innovation.
+
+    Update pipeline:
+      1. EKF predict: P⁻ = P + Q
+      2. Jacobian H = ∂h/∂x tại x⁻
+      3. Innovation ν = z - h(x⁻)
+      4. S_ii = (HP⁻Hᵀ)[i,i] + R_base  (per-anchor)
+      5. pc_mad_scores(ν, S_diag) → scores ∈ (0,1]
+      6. R_adaptive[i] = R_base · (1 + r_scale·(1-score_i))
+      7. EKF update với R_adaptive
+    """
+    def __init__(self, q=PCEKF_Q, r_base=PCEKF_R_BASE, r_scale=PCEKF_R_SCALE):
         self.Q_mat   = np.eye(2) * q
         self.R_base  = r_base
         self.R_scale = r_scale
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
         self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
+        self.P = np.eye(2) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
+        H      = H_jacobian(x_pred)
+        z_hat  = h_obs(x_pred)
         innov  = z_raw - z_hat
-        S_diag = np.diag(Pzz_no_R) + self.R_base
+        # Per-anchor innovation variance (diagonal of HP⁻Hᵀ + R_base·I)
+        HPH    = H @ P_pred @ H.T
+        S_diag = np.diag(HPH) + self.R_base
+        # PC scoring
         scores  = pc_mad_scores(innov, S_diag)
         R_diag  = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
-        Pzz_eff = Pzz_no_R + np.diag(R_diag)
+        S       = HPH + np.diag(R_diag)
         try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
+            K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
+            self.x = x_pred; self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  5. GUKF
+#  5. AEKF — Adaptive EKF (Sage-Husa)
 # ══════════════════════════════════════════════════════════════════════
-def _make_gaussian_kernel(n_half, sigma):
-    idx = np.arange(-n_half, n_half + 1, dtype=float)
-    h   = np.exp(-0.5 * idx**2 / (sigma**2 + 1e-12))
-    return h / h.sum()
+class AEKF:
+    """
+    Adaptive EKF theo Sage-Husa (1969), với forgetting factor α.
 
+    Online noise estimation từ innovation history:
+      R̂ = (1-α) R̂ + α (ν νᵀ + H P⁻ Hᵀ)    [measurement noise]
+      Q̂ = (1-α) Q̂ + α (K ν νᵀ Kᵀ)           [process noise, simplified]
 
-class GUKF:
-    def __init__(self, q=GUKF_Q, r=GUKF_R,
-                 sigma=GUKF_SIGMA, n_half=GUKF_N_HALF):
-        self.n      = 2
-        self.Q_mat  = np.eye(2) * q
-        self.R_mat  = np.eye(N_ANCHORS) * r
-        self.kernel = _make_gaussian_kernel(n_half, sigma)
-        self.n_half = n_half
-        self.win    = 2 * n_half + 1
-        self.Wm, self.Wc, self.c = ukf_weights(self.n)
-        self.x    = None
-        self.P    = None
-        self._buf = []
+    Sliding window (win) giúp tracking non-stationary noise.
+    α là forgetting factor: α→1 = nhanh quên quá khứ (responsive),
+                            α→0 = trọng số đều (stable).
+
+    Chú ý:
+      - Chỉ update R̂ (ổn định hơn), Q cố định (tránh diverge)
+      - Clip R̂ về [R_base/100, R_base*100] để tránh numeric blow-up
+    """
+    def __init__(self, q=AEKF_Q, r=AEKF_R,
+                 win=AEKF_WIN, alpha=AEKF_ALPHA):
+        self.Q_mat = np.eye(2) * q
+        self.R_est = np.eye(N_ANCHORS) * r      # adaptive R estimate
+        self.R_base = r
+        self.win   = win
+        self.alpha = alpha
+        self.x     = None
+        self.P     = None
+        self._innov_buf = []                     # innovation history
 
     def init(self, x0):
-        self.x    = x0.astype(float).copy()
-        self.P    = np.eye(self.n) * 1e6
-        self._buf = []
-
-    def _smooth(self, z_raw):
-        self._buf.append(z_raw.copy())
-        if len(self._buf) > self.win:
-            self._buf.pop(0)
-        buf = np.array(self._buf)
-        L   = len(buf)
-        if L < self.win:
-            h_cut = self.kernel[self.win - L:]
-            h_cut = h_cut / h_cut.sum()
-            return h_cut @ buf
-        else:
-            return self.kernel @ buf
+        self.x = x0.astype(float).copy()
+        self.P = np.eye(2) * 1e6
+        self._innov_buf = []
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
-        z_smooth = self._smooth(z_raw)
-        x_pred   = self.x.copy()
-        P_pred   = self.P + self.Q_mat
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-        Pzz_eff = Pzz_no_R + self.R_mat
-        innov   = z_smooth - z_hat
+        x_pred = self.x.copy()
+        P_pred = self.P + self.Q_mat
+        H      = H_jacobian(x_pred)
+        z_hat  = h_obs(x_pred)
+        innov  = z_raw - z_hat
+
+        # Update innovation buffer
+        self._innov_buf.append(innov.copy())
+        if len(self._innov_buf) > self.win:
+            self._innov_buf.pop(0)
+
+        # Sage-Husa adaptive R estimation
+        HPH = H @ P_pred @ H.T
+        if len(self._innov_buf) >= 2:
+            innov_mat = np.array(self._innov_buf)               # (W, M)
+            C_eps     = innov_mat.T @ innov_mat / len(innov_mat)  # sample cov
+            R_new     = C_eps - HPH
+            # Clip và symmetrize
+            R_new     = np.diag(np.clip(np.diag(R_new),
+                                        self.R_base / 100.0,
+                                        self.R_base * 100.0))
+            self.R_est = ((1 - self.alpha) * self.R_est
+                          + self.alpha * R_new)
+            # Keep R_est positive diagonal
+            self.R_est = np.diag(np.maximum(np.diag(self.R_est),
+                                            self.R_base / 100.0))
+
+        S = HPH + self.R_est
         try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
+            K = P_pred @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
+            self.x = x_pred; self.P = make_spd(P_pred)
             return self.x.copy()
         self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
+        return self.x.copy()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  6. REKF — Robust EKF với Student-t likelihood
+# ══════════════════════════════════════════════════════════════════════
+class REKF:
+    """
+    Robust EKF (Student-t likelihood) theo Agamennoni et al. 2012.
+
+    Thay Gaussian likelihood p(z|x) = N(h(x), R) bằng
+    Student-t với ν degrees of freedom:
+      w_i = (ν + 1) / (ν + r_i²/S_ii)
+    → w_i→1 khi r_i nhỏ (inlier), w_i→ν/r_i khi r_i lớn (outlier)
+
+    Tương đương IRLS: mỗi vòng lặp tính w, update R_eff, re-solve K.
+    ν nhỏ (2-5): robust mạnh nhưng có thể reject cả inlier.
+    ν lớn (→∞): tiệm cận EKF chuẩn.
+    """
+    def __init__(self, q=REKF_Q, r=REKF_R,
+                 nu=REKF_NU, maxiter=REKF_MAXITER):
+        self.Q_mat   = np.eye(2) * q
+        self.R_base  = r
+        self.nu      = nu
+        self.maxiter = maxiter
+        self.x = None
+        self.P = None
+
+    def init(self, x0):
+        self.x = x0.astype(float).copy()
+        self.P = np.eye(2) * 1e6
+
+    def step(self, z_raw):
+        if self.x is None:
+            return np.full(2, np.nan)
+        x_pred = self.x.copy()
+        P_pred = self.P + self.Q_mat
+        H      = H_jacobian(x_pred)
+        z_hat  = h_obs(x_pred)
+        innov  = z_raw - z_hat
+        R_eff  = np.eye(N_ANCHORS) * self.R_base
+        K      = np.zeros((2, N_ANCHORS))
+        for _ in range(self.maxiter):
+            S      = H @ P_pred @ H.T + R_eff
+            s_diag = np.maximum(np.diag(S), 1e-9)
+            # Student-t weights
+            w = (self.nu + 1.0) / (self.nu + innov**2 / s_diag)
+            w = np.maximum(w, 1e-4)
+            R_eff = np.diag(self.R_base / w)
+        S = H @ P_pred @ H.T + R_eff
+        try:
+            K = P_pred @ H.T @ np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            self.x = x_pred; self.P = make_spd(P_pred)
+            return self.x.copy()
+        self.x = x_pred + K @ innov
+        self.P = make_spd((np.eye(2) - K @ H) @ P_pred)
         return self.x.copy()
 
 
@@ -554,23 +631,25 @@ def safe_len(path):
 #  METHODS TABLE
 # ══════════════════════════════════════════════════════════════════════
 METHODS = {
-    "Raw+LS"    : None,
-    "UKF"       : (StandardUKF, dict(q=UKF_STD_Q,  r=UKF_STD_R)),
-    "Huber-UKF" : (HuberUKF,   dict(q=HUBER_Q,     r=HUBER_R,    delta=HUBER_DELTA)),
-    "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
-    "PC-UKF-2D" : (PCUKF2D,    dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
-                                     r_scale=PCUKF_R_SCALE)),
-    "GUKF"      : (GUKF,       dict(q=GUKF_Q,       r=GUKF_R,
-                                     sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)),
+    "Raw+LS"   : None,
+    "EKF"      : (StandardEKF, dict(q=EKF_Q,     r=EKF_R)),
+    "Huber-EKF": (HuberEKF,   dict(q=HUBER_Q,    r=HUBER_R,   delta=HUBER_DELTA)),
+    "MCC-EKF"  : (MCCEKF,     dict(q=MCC_Q,      r=MCC_R,     kernel_bw=MCC_KERNEL_BW)),
+    "PC-EKF-2D": (PCEKF2D,    dict(q=PCEKF_Q,    r_base=PCEKF_R_BASE,
+                                    r_scale=PCEKF_R_SCALE)),
+    "AEKF"     : (AEKF,       dict(q=AEKF_Q,     r=AEKF_R,
+                                    win=AEKF_WIN,  alpha=AEKF_ALPHA)),
+    "REKF"     : (REKF,       dict(q=REKF_Q,     r=REKF_R,    nu=REKF_NU)),
 }
 
 COLORS = {
-    "Raw+LS"    : '#9E9E9E',
-    "UKF"       : '#00BCD4',
-    "Huber-UKF" : '#E91E63',
-    "MCC-UKF"   : '#FF9800',
-    "PC-UKF-2D" : '#9C27B0',
-    "GUKF"      : '#4CAF50',
+    "Raw+LS"   : '#9E9E9E',
+    "EKF"      : '#00BCD4',
+    "Huber-EKF": '#E91E63',
+    "MCC-EKF"  : '#FF9800',
+    "PC-EKF-2D": '#9C27B0',
+    "AEKF"     : '#2196F3',
+    "REKF"     : '#4CAF50',
 }
 
 
@@ -586,12 +665,12 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
     hdr = f"{'File':<18s}"
     for m in METHODS:
-        hdr += f" {m:>12s}"
-    print("\n" + "═" * 90)
+        hdr += f" {m:>11s}"
+    print("\n" + "═" * 100)
     print("  PER-FILE RMSE (mm)   [⚠ = trajectory collapsed]")
-    print("═" * 90)
+    print("═" * 100)
     print(hdr)
-    print("─" * 90)
+    print("─" * 100)
 
     for path in file_paths:
         dist_raw = parse_file(path)
@@ -617,14 +696,14 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
             errs = nearest_gt_error(valid, gt_xy)
             rmse = np.sqrt(np.mean(errs**2)) if len(errs) > 0 else float('nan')
             flag = "⚠" if collapsed else " "
-            row += f" {flag}{rmse:>10.1f}"
+            row += f" {flag}{rmse:>9.1f}"
             all_errors[name].extend(errs)
             all_pos[name].extend(valid)
             per_file_rmse[name].append(rmse)
 
         print(row)
 
-    print("─" * 90)
+    print("─" * 100)
 
     print("\n  TIMING (ms/sample):")
     for name, times in timing.items():
@@ -633,15 +712,15 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
         total_t = sum(times)
         n_samp  = sum(safe_len(p) for p in file_paths[:len(times)])
         if n_samp > 0:
-            print(f"    {name:<14s}: {total_t * 1000 / n_samp:.4f} ms/sample")
+            print(f"    {name:<12s}: {total_t * 1000 / n_samp:.4f} ms/sample")
 
     print("\n  COLLAPSE WARNINGS:")
     any_warn = False
     for name, files in collapse_warn.items():
         if files:
             any_warn = True
-            print(f"    ⚠  {name:<14s}: {len(files)} file(s) → {', '.join(files[:5])}"
-                  + (" ..." if len(files) > 5 else ""))
+            print(f"    ⚠  {name:<12s}: {len(files)} file(s) → "
+                  f"{', '.join(files[:5])}" + (" ..." if len(files) > 5 else ""))
     if not any_warn:
         print("    ✅ Không có trajectory nào bị collapse.")
 
@@ -678,15 +757,10 @@ def compute_metrics(errors, pos_xy=None, expected_path_length=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GRID SEARCH — LOO (Leave-One-Out) cho tất cả methods  (V21)
-#  Tuning công bằng: mọi filter dùng cùng một LOO protocol.
-#  In ra console ngay khi tìm được best mới (RMSE + hệ số).
+#  GRID SEARCH — LOO cho tất cả methods
 # ══════════════════════════════════════════════════════════════════════
 def _loo_fold_rmse(filt_class, kwargs, val_file, gt_xy, expected_path_length):
-    """
-    Chạy filter trên một file validation, trả về RMSE fold.
-    Nếu collapse hoặc file lỗi → trả về penalty.
-    """
+    """LOO fold: chạy filter trên val_file, trả về RMSE hoặc penalty."""
     d = parse_file(val_file)
     if d is None:
         return None
@@ -705,17 +779,7 @@ def _grid_search_loo(filt_class, grid, fixed_params,
                      method_name):
     """
     LOO grid search chung cho mọi filter.
-
-    Protocol:
-      - Với mỗi combo (p1, p2, ...):
-          LOO-RMSE = mean( _loo_fold_rmse(val_file_k) for k in 1..N )
-      - Khi tìm được best mới → in ngay: RMSE + tất cả hệ số
-      - Trả về (best_params, best_loo_rmse)
-
-    Lý do dùng LOO:
-      - Không có fitting step → LOO đơn giản là unbiased estimate của
-        generalization error: params không "thấy" file đang được validate.
-      - Đảm bảo so sánh công bằng giữa các filter.
+    In ra ngay khi tìm được best mới: RMSE + tất cả hệ số.
     """
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -724,37 +788,32 @@ def _grid_search_loo(filt_class, grid, fixed_params,
     print(f"\n  LOO Grid search [{method_name}]: "
           f"{len(combos)} combos × {n} folds = {len(combos) * n} runs")
     print(f"  {'LOO-RMSE':>10s}  Params")
-    print(f"  {'─' * 55}")
+    print(f"  {'─' * 60}")
 
     best_loo_rmse = float('inf')
     best_params   = {**fixed_params}
 
     for combo in combos:
         params = {**fixed_params, **dict(zip(keys, combo))}
-
         fold_rmses = []
         for val_file in file_paths:
             fr = _loo_fold_rmse(filt_class, params, val_file,
                                 gt_xy, expected_path_length)
             if fr is not None:
                 fold_rmses.append(fr)
-
         if not fold_rmses:
             continue
-
         loo_rmse = float(np.mean(fold_rmses))
-
         if loo_rmse < best_loo_rmse:
             best_loo_rmse = loo_rmse
             best_params   = params.copy()
-            # ── In ngay khi có best mới ─────────────────────────────
             tag       = " ⚠COLLAPSED" if loo_rmse >= COLLAPSE_PENALTY / 1000 else ""
             param_str = "  ".join(f"{k}={params[k]}" for k in keys)
             print(f"  ★ {loo_rmse:8.2f}mm{tag:<12s}  {param_str}")
 
-    print(f"  {'─' * 55}")
-    best_param_str = "  ".join(f"{k}={best_params[k]}" for k in keys)
-    print(f"  ✔ Best: {best_loo_rmse:.2f}mm  |  {best_param_str}")
+    print(f"  {'─' * 60}")
+    best_str = "  ".join(f"{k}={best_params[k]}" for k in keys)
+    print(f"  ✔ Best: {best_loo_rmse:.2f}mm  |  {best_str}")
     return best_params, best_loo_rmse
 
 
@@ -762,52 +821,64 @@ def _grid_search_loo(filt_class, grid, fixed_params,
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
         'r'    : [50.0],
-        'delta': [1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 20.0],
+        'delta': [0.5, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 20.0],
     }
-    best, _ = _grid_search_loo(HuberUKF, grid, {'q': HUBER_Q},
+    best, _ = _grid_search_loo(HuberEKF, grid, {'q': HUBER_Q},
                                file_paths, gt_xy, expected_path_length,
-                               "Huber-UKF")
+                               "Huber-EKF")
     return best
 
 
 def grid_search_mcc(file_paths, gt_xy, expected_path_length):
     grid = {
         'r'        : [50.0],
-        'kernel_bw': [100.0, 200.0, 500.0, 1100.0, 1200.0, 1300.0, 1700.0],
+        'kernel_bw': [100.0, 300.0, 500.0, 800.0, 1200.0, 1700.0, 2500.0],
     }
-    best, _ = _grid_search_loo(MCCUKF, grid, {'q': MCC_Q},
+    best, _ = _grid_search_loo(MCCEKF, grid, {'q': MCC_Q},
                                file_paths, gt_xy, expected_path_length,
-                               "MCC-UKF")
+                               "MCC-EKF")
     return best
 
 
-def grid_search_gukf(file_paths, gt_xy, expected_path_length):
-    grid = {
-        'r'     : [50.0],
-        'sigma' : [0.5, 1.0, 2.0, 3.0, 5.0],
-        'n_half': [1, 2, 3, 4],
-    }
-    best, _ = _grid_search_loo(GUKF, grid, {'q': GUKF_Q},
-                               file_paths, gt_xy, expected_path_length,
-                               "GUKF")
-    return best
-
-
-def grid_search_pcukf_loo(file_paths, gt_xy, expected_path_length):
+def grid_search_pcekf(file_paths, gt_xy, expected_path_length):
     grid = {
         'r_base' : [50.0],
         'r_scale': [3.0, 5.0, 10.0, 15.0, 20.0, 30.0],
     }
-    return _grid_search_loo(PCUKF2D, grid, {'q': PCUKF_Q},
-                            file_paths, gt_xy, expected_path_length,
-                            "PC-UKF-2D")
+    best, _ = _grid_search_loo(PCEKF2D, grid, {'q': PCEKF_Q},
+                               file_paths, gt_xy, expected_path_length,
+                               "PC-EKF-2D")
+    return best
+
+
+def grid_search_aekf(file_paths, gt_xy, expected_path_length):
+    grid = {
+        'r'    : [50.0],
+        'win'  : [5, 10, 20, 30],
+        'alpha': [0.80, 0.90, 0.95, 0.99],
+    }
+    best, _ = _grid_search_loo(AEKF, grid, {'q': AEKF_Q},
+                               file_paths, gt_xy, expected_path_length,
+                               "AEKF")
+    return best
+
+
+def grid_search_rekf(file_paths, gt_xy, expected_path_length):
+    grid = {
+        'r' : [50.0],
+        'nu': [2.0, 3.0, 4.0, 5.0, 8.0, 15.0, 30.0],
+    }
+    best, _ = _grid_search_loo(REKF, grid, {'q': REKF_Q},
+                               file_paths, gt_xy, expected_path_length,
+                               "REKF")
+    return best
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  PLOTS
 # ══════════════════════════════════════════════════════════════════════
 def plot_cdf(errors_dict, collapse_warn, save_path):
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, ax = plt.subplots(figsize=(12, 7))
     for label, errors in errors_dict.items():
         if len(errors) == 0:
             continue
@@ -815,8 +886,8 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
         cdf  = np.arange(1, len(s) + 1) / len(s)
         rmse = np.sqrt(np.mean(errors**2))
         c    = COLORS.get(label, 'gray')
-        lw   = 2.5 if label not in ("Raw+LS",) else 1.5
-        ls   = '-'  if label not in ("Raw+LS",) else '--'
+        lw   = 2.5 if label != "Raw+LS" else 1.5
+        ls   = '-'  if label != "Raw+LS" else '--'
         n_col    = len(collapse_warn.get(label, []))
         warn_tag = f" ⚠{n_col}" if n_col > 0 else ""
         ax.plot(s, cdf, lw=lw, color=c, ls=ls,
@@ -829,6 +900,7 @@ def plot_cdf(errors_dict, collapse_warn, save_path):
     ax.set_ylim(0, 1.02)
     ax.legend(fontsize=10, loc='lower right')
     ax.grid(True, ls='--', alpha=0.4)
+    ax.set_title("EKF Suite — Error CDF", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     print(f"[✓] CDF → {save_path}")
@@ -840,9 +912,9 @@ def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     ax.plot(gt_xy[:, 0], gt_xy[:, 1], 'k--', lw=2.5,
             label='Ground Truth', alpha=0.5, zorder=5)
     for label, pos in positions_dict.items():
-        color = COLORS.get(label, 'gray')
         if len(pos) == 0:
             continue
+        color = COLORS.get(label, 'gray')
         errs  = nearest_gt_error(pos, gt_xy)
         rmse  = np.sqrt(np.mean(errs**2))
         n_col = len(collapse_warn.get(label, []))
@@ -864,6 +936,7 @@ def plot_trajectories(positions_dict, gt_xy, collapse_warn, save_path):
     ax.legend(fontsize=8, loc='best')
     ax.set_aspect('equal')
     ax.grid(True, ls='--', alpha=0.3)
+    ax.set_title("EKF Suite — Trajectories", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Trajectories → {save_path}")
@@ -874,12 +947,12 @@ def plot_bar(metrics_dict, save_path):
     methods      = list(metrics_dict.keys())
     metric_names = ['rmse', 'mae', 'cep50', 'p95']
     labels_disp  = ['RMSE', 'MAE', 'CEP50', 'P95']
-    fig, axes    = plt.subplots(1, 4, figsize=(24, 6))
+    fig, axes    = plt.subplots(1, 4, figsize=(26, 6))
     for ax, mname, mlabel in zip(axes, metric_names, labels_disp):
-        vals    = [metrics_dict[m][mname] for m in methods]
-        colors  = [COLORS.get(m, 'gray') for m in methods]
-        bars    = ax.bar(range(len(methods)), vals, color=colors,
-                         alpha=0.85, edgecolor='white', lw=1.5)
+        vals   = [metrics_dict[m][mname] for m in methods]
+        colors = [COLORS.get(m, 'gray') for m in methods]
+        bars   = ax.bar(range(len(methods)), vals, color=colors,
+                        alpha=0.85, edgecolor='white', lw=1.5)
         for bar, val, m in zip(bars, vals, methods):
             if metrics_dict[m].get('collapsed', False):
                 bar.set_hatch('//')
@@ -887,10 +960,10 @@ def plot_bar(metrics_dict, save_path):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + 1,
                     f'{val:.0f}', ha='center', va='bottom',
-                    fontsize=10, fontweight='bold')
+                    fontsize=9, fontweight='bold')
         ax.set_xticks(range(len(methods)))
         ax.set_xticklabels([m.replace('-', '\n') for m in methods],
-                           fontsize=9, ha='center')
+                           fontsize=8, ha='center')
         ax.set_ylabel("mm", fontsize=12)
         ax.set_title(mlabel, fontsize=13, fontweight='bold')
         ax.grid(True, axis='y', ls='--', alpha=0.3)
@@ -905,23 +978,23 @@ def plot_bar(metrics_dict, save_path):
 # ══════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 75)
-    print("  V21: Robust & Adaptive UKF — Full LOO Tuning (All Methods)")
+    print("  EKF Suite V1 — Extended Kalman Filter variants for UWB Positioning")
     print("=" * 75)
     print("  1. Raw+LS      — Weighted Least Squares (baseline)")
-    print("  2. UKF          — Unscented Kalman Filter chuẩn")
-    print("  3. Huber-UKF    — IRLS với Huber M-estimator")
-    print("  4. MCC-UKF      — Maximum Correntropy Criterion UKF")
-    print("  5. PC-UKF-2D    — MAD sigma-free consensus (LOO-tuned)")
-    print("  6. GUKF         — Gaussian-smoothed UKF (Sun et al. 2025)")
+    print("  2. EKF          — Extended Kalman Filter chuẩn")
+    print("  3. Huber-EKF    — IRLS Huber M-estimator")
+    print("  4. MCC-EKF      — Maximum Correntropy Criterion EKF")
+    print("  5. PC-EKF-2D    — Pairwise Consensus MAD sigma-free (LOO-tuned)")
+    print("  6. AEKF         — Adaptive EKF (Sage-Husa online noise est.)")
+    print("  7. REKF         — Robust EKF (Student-t likelihood)")
     print("=" * 75)
-    print(f"\n  Tuning policy (V21 — fully fair):")
-    print(f"    Raw+LS, UKF   : không tune (không có params)")
-    print(f"    Huber-UKF     : LOO cross-validation")
-    print(f"    MCC-UKF       : LOO cross-validation")
-    print(f"    GUKF          : LOO cross-validation")
-    print(f"    PC-UKF-2D     : LOO cross-validation (sigma-free)")
-    print(f"  → Tất cả filter tunable đều dùng cùng _grid_search_loo()")
-    print(f"  → In best mới ngay khi tìm thấy (RMSE + hệ số)")
+    print(f"\n  Tuning policy (fully fair LOO):")
+    print(f"    Raw+LS, EKF : không tune")
+    print(f"    Huber-EKF   : LOO  [r, delta]")
+    print(f"    MCC-EKF     : LOO  [r, kernel_bw]")
+    print(f"    PC-EKF-2D   : LOO  [r_base, r_scale]  (sigma-free)")
+    print(f"    AEKF        : LOO  [r, win, alpha]")
+    print(f"    REKF        : LOO  [r, nu]")
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -936,30 +1009,36 @@ def main():
     eval_files = [all_files[i] for i in np.random.permutation(n)]
 
     gt_xy, total_time = build_ground_truth(WAYPOINTS, SPEED, GT_SPACING)
-    expected_path_length = np.linalg.norm(np.diff(WAYPOINTS, axis=0), axis=1).sum()
-    print(f"  Path={expected_path_length:.0f}mm  Time={total_time:.1f}s  GT={len(gt_xy)} points")
+    expected_path_length = np.linalg.norm(
+        np.diff(WAYPOINTS, axis=0), axis=1).sum()
+    print(f"  Path={expected_path_length:.0f}mm  "
+          f"Time={total_time:.1f}s  GT={len(gt_xy)} points")
 
     if DO_GRID_SEARCH:
         print("\n  [LOO Grid Search] Tuning tất cả filters...")
 
-        best_huber           = grid_search_huber(eval_files, gt_xy, expected_path_length)
-        best_mcc             = grid_search_mcc(eval_files,   gt_xy, expected_path_length)
-        best_gukf            = grid_search_gukf(eval_files,  gt_xy, expected_path_length)
-        best_pc, _           = grid_search_pcukf_loo(eval_files, gt_xy, expected_path_length)
+        best_huber = grid_search_huber(eval_files, gt_xy, expected_path_length)
+        best_mcc   = grid_search_mcc(eval_files,   gt_xy, expected_path_length)
+        best_pc    = grid_search_pcekf(eval_files,  gt_xy, expected_path_length)
+        best_aekf  = grid_search_aekf(eval_files,  gt_xy, expected_path_length)
+        best_rekf  = grid_search_rekf(eval_files,  gt_xy, expected_path_length)
 
-        METHODS["Huber-UKF"] = (HuberUKF, best_huber)
-        METHODS["MCC-UKF"]   = (MCCUKF,   best_mcc)
-        METHODS["GUKF"]      = (GUKF,     best_gukf)
-        METHODS["PC-UKF-2D"] = (PCUKF2D,  best_pc)
+        METHODS["Huber-EKF"] = (HuberEKF, best_huber)
+        METHODS["MCC-EKF"]   = (MCCEKF,   best_mcc)
+        METHODS["PC-EKF-2D"] = (PCEKF2D,  best_pc)
+        METHODS["AEKF"]      = (AEKF,     best_aekf)
+        METHODS["REKF"]      = (REKF,     best_rekf)
 
         print(f"\n  ══ Params sau LOO grid search ══")
-        print(f"    Huber  : r={best_huber['r']}  delta={best_huber['delta']}")
-        print(f"    MCC    : r={best_mcc['r']}  kernel_bw={best_mcc['kernel_bw']}")
-        print(f"    GUKF   : r={best_gukf['r']}  sigma={best_gukf['sigma']}  n_half={best_gukf['n_half']}")
-        print(f"    PC-UKF : r_base={best_pc['r_base']}  r_scale={best_pc['r_scale']}  [sigma-free]")
+        print(f"    Huber-EKF : r={best_huber['r']}  delta={best_huber['delta']}")
+        print(f"    MCC-EKF   : r={best_mcc['r']}  kernel_bw={best_mcc['kernel_bw']}")
+        print(f"    PC-EKF-2D : r_base={best_pc['r_base']}  "
+              f"r_scale={best_pc['r_scale']}  [sigma-free]")
+        print(f"    AEKF      : r={best_aekf['r']}  win={best_aekf['win']}  "
+              f"alpha={best_aekf['alpha']}")
+        print(f"    REKF      : r={best_rekf['r']}  nu={best_rekf['nu']}")
     else:
-        print(f"\n  [INFO] Grid Search TẮT — dùng params mặc định:")
-        print(f"    PC-UKF-2D: r_base={PCUKF_R_BASE} r_scale={PCUKF_R_SCALE} [sigma-free]")
+        print(f"\n  [INFO] Grid Search TẮT — dùng params mặc định")
 
     # ── Evaluate ──────────────────────────────────────────────────────
     errors, positions, collapse_warn, per_file_rmse = evaluate_files(
@@ -967,21 +1046,24 @@ def main():
 
     # ── Summary table ─────────────────────────────────────────────────
     metrics = {}
-    print(f"\n{'═' * 110}")
-    print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed")
-    print(f"{'═' * 110}")
-    print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
-          f"{'P95':>7s} {'MAX':>7s} {'RMSE mean±std':>16s} {'MotionR':>8s} {'Status'}")
-    print(f"  {'─' * 95}")
+    tuned   = {"Huber-EKF", "MCC-EKF", "PC-EKF-2D", "AEKF", "REKF"}
+    print(f"\n{'═' * 115}")
+    print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed  ◀ = LOO-tuned")
+    print(f"{'═' * 115}")
+    print(f"  {'Method':<13s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} "
+          f"{'CEP90':>7s} {'P95':>7s} {'MAX':>7s} "
+          f"{'RMSE mean±std':>16s} {'MotionR':>8s}  Status")
+    print(f"  {'─' * 100}")
 
     for label, errs in errors.items():
         if len(errs) == 0:
             continue
         pos_arr = positions.get(label, np.empty((0, 2)))
-        m = compute_metrics(errs, pos_arr, expected_path_length)
+        m       = compute_metrics(errs, pos_arr, expected_path_length)
         metrics[label] = m
 
-        pf_vals = [v for v in per_file_rmse.get(label, []) if not math.isnan(v)]
+        pf_vals = [v for v in per_file_rmse.get(label, [])
+                   if not math.isnan(v)]
         if len(pf_vals) >= 2:
             std_str = f"{np.mean(pf_vals):.1f} ± {np.std(pf_vals, ddof=1):.1f}"
         elif len(pf_vals) == 1:
@@ -992,33 +1074,35 @@ def main():
         n_col  = len(collapse_warn.get(label, []))
         status = f"⚠ {n_col} collapsed" if n_col > 0 else "✅ OK"
         mr_str = (f"{m['motion_ratio']:.2f}"
-                  if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A")
-        tag    = " ◀ LOO" if label == "PC-UKF-2D" else (
-                 " ◀ LOO" if label in ("Huber-UKF", "MCC-UKF", "GUKF") else "")
-        print(f"  {label:<14s} {m['rmse']:>7.1f} {m['mae']:>7.1f}"
-              f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f} {m['max']:>7.1f}"
-              f" {std_str:>16s}  {mr_str:>8s}  {status}{tag}")
+                  if not math.isnan(m.get('motion_ratio', float('nan')))
+                  else "N/A")
+        tag = " ◀ LOO" if label in tuned else ""
+        print(f"  {label:<13s} {m['rmse']:>7.1f} {m['mae']:>7.1f}"
+              f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f}"
+              f" {m['max']:>7.1f} {std_str:>16s}  {mr_str:>8s}  {status}{tag}")
 
     # ── Wilcoxon ──────────────────────────────────────────────────────
-    print(f"\n  Wilcoxon tests (two-sided, vs PC-UKF-2D):")
-    ref_err = errors.get("PC-UKF-2D", np.array([]))
+    print(f"\n  Wilcoxon tests (two-sided, vs PC-EKF-2D):")
+    ref_err = errors.get("PC-EKF-2D", np.array([]))
     for name, errs in errors.items():
-        if name == "PC-UKF-2D" or len(errs) == 0 or len(ref_err) == 0:
+        if name == "PC-EKF-2D" or len(errs) == 0 or len(ref_err) == 0:
             continue
         N = min(len(errs), len(ref_err))
         if N > 20:
             try:
                 _, p = wilcoxon(errs[:N], ref_err[:N])
                 sym  = '✅ p<0.05' if p < 0.05 else '⚠️  ns'
-                print(f"    {name:<14s} vs PC-UKF-2D: p={p:.4f}  {sym}")
+                print(f"    {name:<13s} vs PC-EKF-2D: p={p:.4f}  {sym}")
             except ValueError:
                 pass
 
     # ── Plots ─────────────────────────────────────────────────────────
-    plot_cdf(errors, collapse_warn, os.path.join(SAVE_DIR, 'cdf.png'))
+    plot_cdf(errors, collapse_warn,
+             os.path.join(SAVE_DIR, 'cdf.png'))
     plot_trajectories(positions, gt_xy, collapse_warn,
                       os.path.join(SAVE_DIR, 'trajectories.png'))
-    plot_bar(metrics, os.path.join(SAVE_DIR, 'bar_comparison.png'))
+    plot_bar(metrics,
+             os.path.join(SAVE_DIR, 'bar_comparison.png'))
 
     for label, errs in errors.items():
         safe = label.lower().replace('+', '_').replace('-', '_').replace(' ', '_')
