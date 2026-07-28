@@ -84,7 +84,7 @@ PCEKF_Q       = 0.01
 PCEKF_R_BASE  = 300.0
 PCEKF_R_SCALE = 2.0   # ← PARAM DUY NHẤT CẦN TUNE (thử 2 → 30)
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_PCEKF_v3"
 
@@ -457,9 +457,9 @@ def grid_search(val_files, gt_xy):
     sigma đã bị loại — chỉ còn q, r_base, r_scale.
     """
     grid = {
-        'q'       : [0.001, 0.01],
-        'r_base'  : [100.0, 200.0, 300.0, 400.0],
-        'r_scale' : [2.0, 5.0, 10.0, 15.0, 20.0, 30.0],
+        'q'       : [0.001, 0.01, 0.1, 1],
+        'r_base'  : [100.0, 200.0, 300.0, 400.0, 500.0, 1000.0, 1500.0, 1700.0, 2000.0],
+        'r_scale' : [2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 70.0, 100.0],
     }
     keys    = list(grid.keys())
     combos  = list(itertools.product(*[grid[k] for k in keys]))
