@@ -85,12 +85,12 @@ UKF_ALPHA = 1e-3
 UKF_BETA  = 2.0
 UKF_KAPPA = 0.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 0.00
+MOTION_RATIO_MIN = 1.00
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -763,7 +763,7 @@ def _eval_rmse_single(filt_class, kwargs, file_paths, gt_xy,
 
 def grid_search_huber(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'    : [1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
+        'r'    : [50.0],
         'delta': [1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 20.0],
     }
     keys   = list(grid.keys())
@@ -785,7 +785,7 @@ def grid_search_huber(file_paths, gt_xy, expected_path_length):
 
 def grid_search_mcc(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'        : [10.0, 50.0, 100.0, 200.0, 300.0, 400.0, 500.0],
+        'r'        : [50.0],
         'kernel_bw': [100.0, 200.0, 500.0, 1100.0, 1200.0, 1300.0, 1700.0],
     }
     keys   = list(grid.keys())
@@ -807,7 +807,7 @@ def grid_search_mcc(file_paths, gt_xy, expected_path_length):
 
 def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r_base' : [10.0, 25.0, 50.0, 100.0, 150.0, 200.0],
+        'r_base' : [50.0],
         'r_scale': [3.0, 5.0, 10.0, 15.0],
         'sigma'  : [1.0, 3.0, 5.0, 7.0, 10.0, 100.0, 200.0, 300.0],
     }
@@ -830,7 +830,7 @@ def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
 
 def grid_search_gukf(file_paths, gt_xy, expected_path_length):
     grid = {
-        'r'      : [10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
+        'r'      : [50.0],
         'sigma'  : [0.5, 1.0, 2.0, 3.0, 5.0],
         'n_half' : [1, 2, 3, 4],
     }

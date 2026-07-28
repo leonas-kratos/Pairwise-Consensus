@@ -72,7 +72,7 @@ PCEKF2D_SIGMA   = 50.0
 PC_KF_Q = 0.01
 PC_KF_R = 200.0
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_vPCEKF"
 
