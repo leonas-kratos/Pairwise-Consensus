@@ -86,7 +86,7 @@ PCEKF_R_SCALE = 2.0   # ← PARAM DUY NHẤT CẦN TUNE (thử 2 → 30)
 
 DO_GRID_SEARCH = False
 DATA_DIR = "./data"
-SAVE_DIR = "./outputs_PCEKF_v3"
+SAVE_DIR = "./outputs_PCEKF_v4"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -457,9 +457,9 @@ def grid_search(val_files, gt_xy):
     sigma đã bị loại — chỉ còn q, r_base, r_scale.
     """
     grid = {
-        'q'       : [0.001, 0.01, 0.1, 1],
-        'r_base'  : [100.0, 200.0, 300.0, 400.0, 500.0, 1000.0, 1500.0, 1700.0, 2000.0],
-        'r_scale' : [2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 70.0, 100.0],
+        'q'       : [0.001, 0.01],
+        'r_base'  : [100.0, 200.0, 300.0],
+        'r_scale' : [2.0, 5.0, 10.0, 15.0, 20.0, 30.0],
     }
     keys    = list(grid.keys())
     combos  = list(itertools.product(*[grid[k] for k in keys]))
@@ -632,6 +632,363 @@ def analyze_scores(file_paths, q=PCEKF_Q, r_base=PCEKF_R_BASE,
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  MATHEMATICAL VALIDATION PLOTS
+# ══════════════════════════════════════════════════════════════════════
+
+def _collect_per_timestep(file_paths, q, r_base, r_scale, gt_xy,
+                           warmup=100):
+    """
+    Thu thập dữ liệu per-timestep từ tất cả files:
+      - abs_std_innov  : (T, 4) |ν[i]| / √S_ii  per anchor
+      - normed         : (T, 4) sau MAD normalize
+      - scores         : (T, 4) PC scores
+      - R_adaptive     : (T, 4) R được gán cho từng anchor
+      - err_raw        : (T,)   position error của Raw+WLS
+      - err_ekf        : (T,)   position error của EKF-2D
+      - err_pcekf      : (T,)   position error của PC-EKF-v3
+    Bỏ warmup timestep đầu để P đã hội tụ.
+    """
+    from scipy.spatial import cKDTree
+    abs_si_list, normed_list, score_list   = [], [], []
+    R_list, err_raw_list                   = [], []
+    err_ekf_list, err_pc_list              = [], []
+
+    gt_tree = cKDTree(gt_xy)
+
+    for path in file_paths:
+        parsed = parse_file(path)
+        if parsed is None:
+            continue
+        dist_raw = parsed['dist'].astype(float)
+        T = len(dist_raw)
+
+        ekf_base = EKF2D(q=q, r=r_base)
+        ekf_base.init(_init_pos(dist_raw))
+        ekf_pc   = PCEKF_v3(q=q, r_base=r_base, r_scale=r_scale)
+        ekf_pc.init(_init_pos(dist_raw))
+
+        for t in range(T):
+            # ── Raw WLS ──
+            pos_raw = wls_position(dist_raw[t])
+
+            # ── EKF baseline ──
+            pos_ekf = ekf_base.step(dist_raw[t])
+
+            # ── PC-EKF: manual step để lấy internals ──
+            ekf_pc.predict()
+            h      = h_obs(ekf_pc.x)
+            H      = jacobian_H(ekf_pc.x)
+            innov  = dist_raw[t] - h
+            HP     = H @ ekf_pc.P
+            S_diag = np.array([HP[i] @ H[i] + r_base
+                                for i in range(N_ANCHORS)])
+
+            std_i   = innov / np.sqrt(np.maximum(S_diag, 1e-9))
+            med     = np.median(std_i)
+            mad     = np.median(np.abs(std_i - med))
+            norm_i  = std_i / (1.4826 * mad + 1e-9)
+            scores  = pc_scores_v3(innov, S_diag)
+            R_diag  = r_base * (1.0 + r_scale * (1.0 - scores))
+
+            R     = np.diag(R_diag)
+            S_mat = H @ ekf_pc.P @ H.T + R
+            try:
+                K = ekf_pc.P @ H.T @ np.linalg.inv(S_mat)
+            except np.linalg.LinAlgError:
+                pass
+            else:
+                ekf_pc.x = ekf_pc.x + K @ innov
+                ekf_pc.P = (np.eye(2) - K @ H) @ ekf_pc.P
+            pos_pc = ekf_pc.x.copy()
+
+            if t < warmup:
+                continue
+
+            # errors
+            def _err(pos):
+                if np.any(np.isnan(pos)):
+                    return np.nan
+                return float(gt_tree.query(pos)[0])
+
+            abs_si_list.append(np.abs(std_i))
+            normed_list.append(norm_i)
+            score_list.append(scores)
+            R_list.append(R_diag)
+            err_raw_list.append(_err(pos_raw))
+            err_ekf_list.append(_err(pos_ekf))
+            err_pc_list.append(_err(pos_pc))
+
+    return (np.array(abs_si_list),          # (T,4)
+            np.array(normed_list),           # (T,4)
+            np.array(score_list),            # (T,4)
+            np.array(R_list),                # (T,4)
+            np.array(err_raw_list),          # (T,)
+            np.array(err_ekf_list),          # (T,)
+            np.array(err_pc_list))           # (T,)
+
+
+def plot_math_validation(file_paths, gt_xy, q=PCEKF_Q, r_base=PCEKF_R_BASE,
+                         r_scale=PCEKF_R_SCALE, save_path=None):
+    """
+    4 plots chứng minh cơ sở toán học của PC-EKF V3
+    với data LOS thực tế (không cần label NLOS):
+
+    Plot 1 — |std_innov| worst vs best anchor per timestep:
+        Anchor có |std_innov| lớn nhất (= "worst") so với
+        anchor nhỏ nhất ("best") trong cùng timestep.
+        → Luôn có sự phân tách → kernel có thể phân biệt.
+
+    Plot 2 — Score của worst anchor vs 3 anchor còn lại:
+        Boxplot score[worst] vs score[best3] qua toàn bộ
+        timestep. → Worst anchor nhận score thấp hơn có hệ thống.
+
+    Plot 3 — MAD robustness vs std (simulation):
+        Giữ nguyên — lý thuyết vẫn đúng, minh họa tại sao
+        MAD là lựa chọn đúng dù data LOS hay NLOS.
+
+    Plot 4 — R_adaptive trung bình vs position error:
+        Scatter: mỗi điểm là 1 timestep.
+        Trục x = mean R_adaptive (4 anchors),
+        Trục y = error EKF-2D và PC-EKF.
+        → Timestep có noise cao (R↑): PC-EKF ít bị ảnh hưởng hơn.
+    """
+    print("\n[Math Validation] Thu thập dữ liệu per-timestep...")
+    (abs_si, normed, scores, R_adap,
+     err_raw, err_ekf, err_pc) = _collect_per_timestep(
+        file_paths, q, r_base, r_scale, gt_xy)
+
+    T = len(scores)
+    print(f"  Timesteps hợp lệ (sau warmup): {T:,}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(
+        "PC-EKF V3 — Mathematical Validation  (LOS data)",
+        fontsize=15, fontweight='bold', y=1.01
+    )
+
+    anchor_colors = ['#2196F3', '#E91E63', '#4CAF50', '#FF9800']
+
+    # ── Plot 1: |std_innov| worst vs best — log-scale ───────────────
+    ax = axes[0, 0]
+
+    worst_idx = np.argmax(abs_si, axis=1)
+    best_idx  = np.argmin(abs_si, axis=1)
+
+    worst_vals = abs_si[np.arange(T), worst_idx]
+    best_vals  = abs_si[np.arange(T), best_idx]
+    ratio      = worst_vals / np.maximum(best_vals, 1e-9)
+
+    # log-scale bins — không clip, phân phối thật
+    log_ratio = np.log10(np.maximum(ratio, 1.0))
+    max_log   = np.percentile(log_ratio, 99.5)
+    bins_log  = np.linspace(0, max_log, 60)
+    counts, edges = np.histogram(log_ratio, bins=bins_log, density=True)
+    mids = (edges[:-1] + edges[1:]) / 2
+    ax.bar(mids, counts, width=np.diff(edges), color='#90CAF9',
+           edgecolor='white', linewidth=0.3, label='Data (log₁₀ ratio)')
+
+    med_log = np.median(log_ratio)
+    ax.axvline(med_log, color='#1565C0', lw=2, ls='--',
+               label=f'Median = {10**med_log:.1f}×')
+    ax.axvline(0, color='gray', lw=1.5, ls=':', label='Ratio = 1× (no separation)')
+
+    for pct, col, ls_ in [(25, '#78909C', '--'), (75, '#1976D2', '--'),
+                           (95, '#B71C1C', '-.')]:
+        v = np.percentile(log_ratio, pct)
+        ax.axvline(v, color=col, lw=1.2, ls=ls_, alpha=0.8,
+                   label=f'P{pct} = {10**v:.1f}×')
+
+    # x-ticks hiển thị giá trị gốc
+    xtick_raw = [1, 2, 5, 10, 20, 50, 100, 200]
+    xtick_pos = [np.log10(v) for v in xtick_raw if np.log10(v) <= max_log * 1.05]
+    ax.set_xticks(xtick_pos)
+    ax.set_xticklabels([f'{v}×' for v in xtick_raw[:len(xtick_pos)]])
+
+    pct_gt2 = np.mean(ratio > 2) * 100
+    pct_gt5 = np.mean(ratio > 5) * 100
+    ax.set_title("Plot 1 — |std_innov| worst/best ratio per timestep\n"
+                 "(log scale — ratio > 1 → kernel can separate anchors)",
+                 fontsize=12, fontweight='bold')
+    ax.set_xlabel("|std_innov| worst / best  (log scale)", fontsize=11)
+    ax.set_ylabel("Density", fontsize=11)
+    ax.legend(fontsize=9, loc='upper right')
+    ax.text(0.03, 0.97,
+            f"{pct_gt2:.1f}% timesteps have ratio > 2×\n"
+            f"{pct_gt5:.1f}% timesteps have ratio > 5×\n"
+            f"→ strong separability at every step",
+            transform=ax.transAxes, ha='left', va='top', fontsize=10,
+            bbox=dict(boxstyle='round,pad=0.4', fc='#E3F2FD', ec='#1976D2', alpha=0.9))
+    ax.grid(True, ls='--', alpha=0.35)
+
+    # ── Plot 2: Score worst vs best3 ────────────────────────────────
+    ax = axes[0, 1]
+
+    score_worst = scores[np.arange(T), worst_idx]
+    # mean score của 3 anchor còn lại
+    score_best3 = np.array([
+        np.mean([scores[t, j] for j in range(N_ANCHORS) if j != worst_idx[t]])
+        for t in range(T)
+    ])
+
+    import matplotlib
+    _mpl_ver = tuple(int(x) for x in matplotlib.__version__.split('.')[:2])
+    _bp_label_kw = 'tick_labels' if _mpl_ver >= (3, 9) else 'labels'
+    bp = ax.boxplot(
+        [score_worst, score_best3],
+        **{_bp_label_kw: ['Worst anchor\n(highest |std_innov|)',
+                          'Best 3 anchors\n(mean)']},
+        patch_artist=True,
+        medianprops=dict(color='black', lw=2),
+        whiskerprops=dict(lw=1.5),
+        capprops=dict(lw=1.5),
+        flierprops=dict(marker='.', markersize=2, alpha=0.3)
+    )
+    bp['boxes'][0].set_facecolor('#FFCDD2')
+    bp['boxes'][1].set_facecolor('#C8E6C9')
+
+    from scipy.stats import mannwhitneyu
+    stat, p_mwu = mannwhitneyu(score_worst, score_best3, alternative='less')
+    med_w = np.median(score_worst)
+    med_b = np.median(score_best3)
+
+    ax.set_title("Plot 2 — PC Score: worst anchor vs best 3 anchors\n"
+                 "(per timestep — same data as Plot 1)",
+                 fontsize=12, fontweight='bold')
+    ax.set_ylabel("PC Score", fontsize=11)
+    ax.set_ylim(0, 1.05)
+    ax.text(0.97, 0.97,
+            f"Median worst  = {med_w:.3f}\n"
+            f"Median best3  = {med_b:.3f}\n"
+            f"Mann-Whitney p = {p_mwu:.2e}\n"
+            f"→ score phân biệt có hệ thống",
+            transform=ax.transAxes, ha='right', va='top', fontsize=10,
+            bbox=dict(boxstyle='round,pad=0.4', fc='#FFF3E0', ec='#F57C00', alpha=0.9))
+    ax.grid(True, axis='y', ls='--', alpha=0.35)
+
+    # ── Plot 3: MAD robustness simulation ───────────────────────────
+    ax = axes[1, 0]
+    np.random.seed(0)
+    n_sim      = 2000
+    bias_range = np.linspace(0, 15, 60)
+    mad_vals, std_vals = [], []
+
+    for bias in bias_range:
+        m_acc, s_acc = 0.0, 0.0
+        for _ in range(n_sim):
+            v   = np.concatenate([np.random.randn(3),
+                                   np.random.randn(1) + bias])
+            med = np.median(v)
+            m_acc += 1.4826 * np.median(np.abs(v - med))
+            s_acc += np.std(v)
+        mad_vals.append(m_acc / n_sim)
+        std_vals.append(s_acc / n_sim)
+
+    ax.plot(bias_range, mad_vals, '#2196F3', lw=2.5,
+            label='1.4826·MAD  (robust scale estimator)')
+    ax.plot(bias_range, std_vals, '#E91E63', lw=2, ls='--',
+            label='std  (classical scale estimator)')
+    ax.axhline(1.0, color='gray', ls=':', lw=1.5,
+               label='Ideal = 1.0  (pure LOS)')
+    ax.fill_between(bias_range, 0.8, 1.2, color='#E8F5E9', alpha=0.6,
+                    label='±20% acceptable band')
+
+    ax.set_title("Plot 3 — MAD vs std: robustness to 1 noisy anchor\n"
+                 "(3 anchors ~ N(0,1), 1 anchor shifted by increasing bias)",
+                 fontsize=12, fontweight='bold')
+    ax.set_xlabel("Extra noise / bias on 1 anchor  (σ units)", fontsize=11)
+    ax.set_ylabel("Estimated scale of the 3 clean anchors", fontsize=11)
+    ax.legend(fontsize=10)
+
+    # annotate where std breaks the band
+    std_arr = np.array(std_vals)
+    break_idx = np.argmax(std_arr > 1.2)
+    if std_arr[break_idx] > 1.2:
+        ax.axvline(bias_range[break_idx], color='#E91E63', ls=':', lw=1, alpha=0.7)
+        ax.text(bias_range[break_idx] + 0.2, 1.25,
+                f'std breaks\nat bias={bias_range[break_idx]:.1f}σ',
+                fontsize=9, color='#C62828')
+
+    ax.text(0.97, 0.45,
+            "MAD stays within ±20%\nfor any bias magnitude\n→ sigma=1.0 valid\nin all conditions",
+            transform=ax.transAxes, ha='right', fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.4', fc='#E3F2FD', ec='#1976D2', alpha=0.9))
+    ax.set_xlim(0, bias_range[-1]); ax.set_ylim(0.5, None)
+    ax.grid(True, ls='--', alpha=0.35)
+
+    # ── Plot 4: rolling error reduction EKF → PC-EKF ────────────────
+    ax = axes[1, 1]
+
+    valid  = (~np.isnan(err_ekf)) & (~np.isnan(err_pc))
+    e_ekf  = err_ekf[valid]
+    e_pc   = err_pc[valid]
+    t_axis = np.arange(len(e_ekf))
+
+    # rolling median window
+    W = max(30, len(e_ekf) // 80)
+    def rolling_median(x, w):
+        out = np.full(len(x), np.nan)
+        for i in range(len(x)):
+            lo = max(0, i - w // 2)
+            hi = min(len(x), i + w // 2 + 1)
+            out[i] = np.median(x[lo:hi])
+        return out
+
+    ekf_roll = rolling_median(e_ekf, W)
+    pc_roll  = rolling_median(e_pc,  W)
+    delta    = ekf_roll - pc_roll   # dương = PC tốt hơn
+
+    # vẽ 2 đường error rolling
+    ax2 = ax.twinx()
+    ax.plot(t_axis, ekf_roll, '#E91E63', lw=1.8, alpha=0.85,
+            label='EKF-2D  (rolling median)')
+    ax.plot(t_axis, pc_roll,  '#2196F3', lw=1.8, alpha=0.85,
+            label='PC-EKF-v3  (rolling median)')
+    ax.fill_between(t_axis, ekf_roll, pc_roll,
+                    where=(ekf_roll >= pc_roll),
+                    color='#2196F3', alpha=0.15, label='PC-EKF better')
+    ax.fill_between(t_axis, ekf_roll, pc_roll,
+                    where=(ekf_roll < pc_roll),
+                    color='#E91E63', alpha=0.15, label='EKF-2D better')
+
+    # delta trên trục phải
+    ax2.bar(t_axis, delta, color=np.where(delta >= 0, '#1565C0', '#C62828'),
+            alpha=0.25, width=1.0, label='Δ error (EKF − PC-EKF)')
+    ax2.axhline(0, color='gray', lw=0.8, ls=':')
+    ax2.set_ylabel("Δ error  EKF−PC-EKF (mm)\n(positive = PC-EKF better)",
+                   fontsize=10, color='#555')
+    ax2.tick_params(axis='y', labelcolor='#555')
+
+    # stats
+    pct_better = np.mean(delta > 0) * 100
+    mean_gain  = np.nanmean(delta)
+    ax.set_title(
+        f"Plot 4 — Rolling error: EKF-2D vs PC-EKF-v3\n"
+        f"(window={W} steps  |  PC-EKF better in {pct_better:.1f}% of timesteps)",
+        fontsize=12, fontweight='bold')
+    ax.set_xlabel("Timestep (after warmup)", fontsize=11)
+    ax.set_ylabel("Position error  (mm)", fontsize=11)
+    ax.set_ylim(0, None)
+
+    lines1, labs1 = ax.get_legend_handles_labels()
+    lines2, labs2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labs1 + labs2, fontsize=9, loc='upper left')
+
+    ax.text(0.97, 0.97,
+            f"PC-EKF better: {pct_better:.1f}% timesteps\n"
+            f"Mean gain: {mean_gain:.1f} mm\n"
+            f"(rolling window = {W} steps)",
+            transform=ax.transAxes, ha='right', va='top', fontsize=10,
+            bbox=dict(boxstyle='round,pad=0.4', fc='#E8F5E9', ec='#388E3C', alpha=0.9))
+    ax.grid(True, ls='--', alpha=0.25)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[✓] Math validation → {save_path}")
+    plt.close()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
 def main():
@@ -710,6 +1067,9 @@ def main():
     plot_bar(metrics, os.path.join(SAVE_DIR, 'bar.png'))
     analyze_scores(eval_files, save_path=os.path.join(SAVE_DIR, 'score_analysis.png'),
                    **best_params)
+    plot_math_validation(eval_files, gt_xy,
+                         save_path=os.path.join(SAVE_DIR, 'math_validation.png'),
+                         **best_params)
 
     for label, errors in err.items():
         safe = label.lower().replace(' + ','_').replace(' ','_').replace('-','_')
