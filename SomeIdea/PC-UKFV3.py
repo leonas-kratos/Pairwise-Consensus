@@ -18,7 +18,7 @@ PC scoring V3:
   - Chỉ còn 1 param cần tune: r_scale
 
 SO SÁNH 3 PHƯƠNG PHÁP:
-  1. Raw + WLS
+  1. Raw + LS
   2. UKF-2D           (fixed R)
   3. PC-UKF-v3        (MAD auto-normalized, sigma-free)
 
@@ -69,18 +69,18 @@ GT_SPACING = 5.0     # mm
 N_ANCHORS  = 4
 
 # UKF-2D baseline params
-UKF2D_Q     = 0.001
-UKF2D_R     = 25.0
+UKF2D_Q     = 0.01
+UKF2D_R     = 50.0
 UKF2D_ALPHA = 1e-3
 UKF2D_BETA  = 2.0
 UKF2D_KAPPA = 0.0
 
 # PC-UKF-v3 params  — chỉ cần tune r_scale!
-PCUKF_Q       = 0.001
-PCUKF_R_BASE  = 25.0
-PCUKF_R_SCALE = 2.0   # ← PARAM DUY NHẤT CẦN TUNE (thử 2 → 30)
+PCUKF_Q       = 0.01
+PCUKF_R_BASE  = 50.0
+PCUKF_R_SCALE = 30.0   # ← PARAM DUY NHẤT CẦN TUNE (thử 2 → 30)
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_PCUKF_v3"
 
@@ -406,12 +406,13 @@ def evaluate_files(file_paths, gt_xy,
     raw_pos_all   = []
     ukf_pos_all   = []
     pcukf_pos_all = []
+    per_file_rmse = {'Raw + LS': [], 'UKF-2D': [], 'PC-UKF-v3': []}
 
     W = 95
     print("\n" + "═"*W)
     print(f"  PC-UKF V3 — PER-FILE RESULTS")
     print("═"*W)
-    print(f"{'File':<18s} {'Raw+WLS':>10s} {'UKF-2D':>10s} "
+    print(f"{'File':<18s} {'Raw+LS':>10s} {'UKF-2D':>10s} "
           f"{'PC-UKF-v3':>12s} | "
           f"{'UKF T_fl':>10s} {'PCUKF T_fl':>11s} {'PCUKF T_smpl':>13s}")
     print("─"*W)
@@ -422,7 +423,7 @@ def evaluate_files(file_paths, gt_xy,
         dist_raw = parsed['dist'].astype(float)
         T = len(dist_raw)
 
-        # 1. Raw + WLS
+        # 1. Raw + LS
         raw_pos = np.array([wls_position(dist_raw[t]) for t in range(T)])
 
         # 2. UKF-2D
@@ -436,14 +437,24 @@ def evaluate_files(file_paths, gt_xy,
         t2 = time.perf_counter()
 
         def filt(p): return p[~np.any(np.isnan(p), axis=1)]
-        def rmse(p): return np.sqrt(np.mean(nearest_gt_error(filt(p), gt_xy)**2))
+        def rmse(p):
+            e = nearest_gt_error(filt(p), gt_xy)
+            return float(np.sqrt(np.mean(e**2))) if len(e) > 0 else float('nan')
+
+        r_raw   = rmse(raw_pos)
+        r_ukf   = rmse(ukf_pos)
+        r_pcukf = rmse(pcukf_pos)
 
         t_ukf   = (t1 - t0) * 1000
         t_pcukf = (t2 - t1) * 1000
         print(f"{os.path.basename(path):<18s}"
-              f"{rmse(raw_pos):>10.1f}{rmse(ukf_pos):>10.1f}"
-              f"{rmse(pcukf_pos):>12.1f} | "
+              f"{r_raw:>10.1f}{r_ukf:>10.1f}"
+              f"{r_pcukf:>12.1f} | "
               f"{t_ukf:>8.1f}ms {t_pcukf:>9.1f}ms {t_pcukf/T*1000:>11.3f}ms")
+
+        per_file_rmse['Raw + LS'] .append(r_raw)
+        per_file_rmse['UKF-2D']   .append(r_ukf)
+        per_file_rmse['PC-UKF-v3'].append(r_pcukf)
 
         raw_pos_all  .extend(filt(raw_pos))
         ukf_pos_all  .extend(filt(ukf_pos))
@@ -455,15 +466,15 @@ def evaluate_files(file_paths, gt_xy,
     pcukf_arr = np.array(pcukf_pos_all)
 
     errors = {
-        'Raw + WLS' : nearest_gt_error(raw_arr,   gt_xy),
+        'Raw + LS' : nearest_gt_error(raw_arr,   gt_xy),
         'UKF-2D'    : nearest_gt_error(ukf_arr,   gt_xy),
         'PC-UKF-v3' : nearest_gt_error(pcukf_arr, gt_xy),
     }
     positions = {'raw': raw_arr, 'ukf': ukf_arr, 'pcukf': pcukf_arr}
-    return errors, positions
+    return errors, positions, per_file_rmse
 
 
-def compute_metrics(errors, label=""):
+def compute_metrics(errors, label="", pf_rmse=None):
     m = {k: float(fn(errors)) for k, fn in [
         ('mae',   np.mean),
         ('rmse',  lambda e: np.sqrt(np.mean(e**2))),
@@ -472,6 +483,21 @@ def compute_metrics(errors, label=""):
         ('p95',   lambda e: np.percentile(e, 95)),
         ('max',   np.max),
     ]}
+    # mean ± std of per-file RMSE
+    if pf_rmse is not None:
+        vals = [v for v in pf_rmse if not math.isnan(v)]
+        if len(vals) >= 2:
+            m['rmse_mean'] = float(np.mean(vals))
+            m['rmse_std']  = float(np.std(vals, ddof=1))
+        elif len(vals) == 1:
+            m['rmse_mean'] = float(vals[0])
+            m['rmse_std']  = float('nan')
+        else:
+            m['rmse_mean'] = float('nan')
+            m['rmse_std']  = float('nan')
+    else:
+        m['rmse_mean'] = float('nan')
+        m['rmse_std']  = float('nan')
     if label:
         print(f"\n{'='*50}\n  {label}\n{'='*50}")
         for k, v in m.items(): print(f"  {k.upper():6s}: {v:8.1f} mm")
@@ -487,9 +513,9 @@ def grid_search(val_files, gt_xy):
     sigma đã bị loại — chỉ còn q, r_base, r_scale.
     """
     grid = {
-        'q'       : [0.001, 0.01],
-        'r_base'  : [25.0, 50.0, 100.0, 200.0],
-        'r_scale' : [2.0, 5.0, 10.0, 15.0, 20.0, 30.0],
+        'q'       : [0.01],
+        'r_base'  : [50.0],
+        'r_scale' : [0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0],
     }
     keys   = list(grid.keys())
     combos = list(itertools.product(*[grid[k] for k in keys]))
@@ -503,23 +529,24 @@ def grid_search(val_files, gt_xy):
 
     for idx, combo in enumerate(combos):
         params = dict(zip(keys, combo))
-        err, _ = evaluate_files(val_files, gt_xy, **params)
-        rmse   = float(np.sqrt(np.mean(err['PC-UKF-v3']**2)))
+        err, _, pf = evaluate_files(val_files, gt_xy, **params)
+        vals   = [v for v in pf['PC-UKF-v3'] if not math.isnan(v)]
+        rmse   = float(np.mean(vals)) if vals else float('inf')
         results.append((rmse, params))
         if rmse < best_rmse:
             best_rmse   = rmse
             best_params = params.copy()
         if (idx + 1) % 20 == 0 or (idx + 1) == n_combo:
-            print(f"  [{idx+1}/{n_combo}] best so far: {best_rmse:.1f}mm")
+            print(f"  [{idx+1}/{n_combo}] best so far: mean RMSE={best_rmse:.1f}mm")
 
     results.sort(key=lambda x: x[0])
     print(f"\n  Top 5 configs (PC-UKF V3):")
-    print(f"  {'RMSE':>8s} {'Q':>8s} {'R_base':>8s} {'r_scale':>8s}")
-    print(f"  {'─'*38}")
+    print(f"  {'mean RMSE':>10s} {'Q':>8s} {'R_base':>8s} {'r_scale':>8s}")
+    print(f"  {'─'*40}")
     for rmse, p in results[:5]:
-        print(f"  {rmse:>7.1f}mm {p['q']:>8.4f} {p['r_base']:>8.1f}"
+        print(f"  {rmse:>9.1f}mm {p['q']:>8.4f} {p['r_base']:>8.1f}"
               f" {p['r_scale']:>8.1f}")
-    print(f"\n  Best: RMSE={best_rmse:.1f}mm | {best_params}")
+    print(f"\n  Best: mean RMSE={best_rmse:.1f}mm | {best_params}")
     return best_params, best_rmse
 
 
@@ -527,12 +554,12 @@ def grid_search(val_files, gt_xy):
 #  PLOTS
 # ══════════════════════════════════════════════════════════════════════
 COLORS = {
-    'Raw + WLS' : '#9E9E9E',
+    'Raw + LS' : '#9E9E9E',
     'UKF-2D'    : '#E91E63',
     'PC-UKF-v3' : '#2196F3',
 }
 LS = {
-    'Raw + WLS' : ':',
+    'Raw + LS' : ':',
     'UKF-2D'    : '--',
     'PC-UKF-v3' : '-',
 }
@@ -697,23 +724,28 @@ def main():
     print(f"\n{'═'*60}\n  Evaluating {len(eval_files)} files\n{'═'*60}")
     print(f"  Params: {best_params}")
 
-    err, positions = evaluate_files(eval_files, gt_xy, **best_params)
-    metrics = {label: compute_metrics(errors, label) for label, errors in err.items()}
+    err, positions, per_file_rmse = evaluate_files(eval_files, gt_xy, **best_params)
+    metrics = {label: compute_metrics(errors, label, pf_rmse=per_file_rmse.get(label))
+               for label, errors in err.items()}
 
     # Summary
-    print(f"\n{'═'*72}")
+    print(f"\n{'═'*88}")
     print(f"  SUMMARY — PC-UKF V3 (sigma-free)")
-    print(f"{'═'*72}")
-    print(f"  {'Method':<18s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'P95':>7s} {'MAX':>7s}")
-    print(f"  {'─'*55}")
+    print(f"{'═'*88}")
+    print(f"  {'Method':<18s} {'RMSE mean±std':>18s} {'MAE':>7s} {'CEP50':>7s} {'P95':>7s} {'MAX':>7s}")
+    print(f"  {'─'*70}")
     for label, m in metrics.items():
         tag = " ◀ V3" if 'PC-UKF-v3' in label else ""
-        print(f"  {label:<18s} {m['rmse']:>6.1f} {m['mae']:>6.1f} "
+        if not math.isnan(m.get('rmse_std', float('nan'))):
+            rmse_str = f"{m['rmse_mean']:>6.1f} ± {m['rmse_std']:.1f}"
+        else:
+            rmse_str = f"{m['rmse_mean']:>6.1f} ± N/A"
+        print(f"  {label:<18s} {rmse_str:>18s} {m['mae']:>6.1f} "
               f"{m['cep50']:>6.1f} {m['p95']:>6.1f} {m['max']:>6.1f}{tag}")
 
     # Wilcoxon
     print(f"\n  Wilcoxon tests (vs PC-UKF-v3):")
-    for a in ['Raw + WLS', 'UKF-2D']:
+    for a in ['Raw + LS', 'UKF-2D']:
         ea, eb = err[a], err['PC-UKF-v3']
         mn = min(len(ea), len(eb))
         if mn > 10:
@@ -731,7 +763,7 @@ def main():
     # Plots
     plot_cdf(err, os.path.join(SAVE_DIR, 'cdf.png'))
     plot_trajectories(
-        {'Raw + WLS' : positions['raw'],
+        {'Raw + LS' : positions['raw'],
          'UKF-2D'    : positions['ukf'],
          'PC-UKF-v3' : positions['pcukf']},
         gt_xy, os.path.join(SAVE_DIR, 'trajectories.png'))

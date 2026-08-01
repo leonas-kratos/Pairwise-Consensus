@@ -7,7 +7,7 @@ CÁC PHƯƠNG PHÁP:
   2. UKF              — Unscented Kalman Filter chuẩn
   3. Huber-UKF        — IRLS Huber M-estimator
   4. MCC-UKF          — Maximum Correntropy Criterion UKF
-  5. PC-UKF-2D        — Pairwise Consensus adaptive R + UKF 2D (tuned)
+  5. PC-UKF-2D        — Pairwise Consensus V3 (MAD auto-normalized, sigma-free)
   6. GUKF             — Gaussian-smoothed UKF
 
 Format file .txt: timestamp, d0_slant, d1_slant, d2_slant, d3_slant, v_mm_s, gz_dps
@@ -33,21 +33,21 @@ warnings.filterwarnings("ignore", category=UserWarning)
 #  CONFIG
 # ══════════════════════════════════════════════════════════════════════
 ANCHORS = np.array([
-    [8800, 0   ],   # A1
-    [8800, 4000],   # A2
-    [0,    4000],   # A3
-    [0,    0   ],   # A4
-], dtype=float)
-
-WAYPOINTS = np.array([
-    [400.0,  3200.0],   # A
-    [400.0,  1000.0],   # B
-    [8000.0, 1000.0],   # C
-    [8000.0, 3200.0],   # D
-    [400.0,  3200.0],   # A
+    [4000, 8800],
+    [0,    8800],
+    [0,    0   ],
+    [4000, 0   ],
 ], dtype=float)
 
 ANCHOR_HEIGHT = 1400.0
+
+WAYPOINTS = np.array([
+    [800.0,  400.0],    # A
+    [3000.0, 400.0],    # B
+    [3000.0, 8000.0],   # C
+    [800.0,  8000.0],   # D
+    [800.0,  400.0],    # A (khép kín)
+], dtype=float)
 
 SPEED      = 200.0
 GT_SPACING = 5.0
@@ -55,7 +55,7 @@ N_ANCHORS  = 4
 
 # ─── Standard UKF ────────────────────────────────────────────────────
 UKF_STD_Q = 0.001
-UKF_STD_R = 50.0
+UKF_STD_R = 100.0
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
 HUBER_Q       = 0.001
@@ -65,19 +65,19 @@ HUBER_MAXITER = 5
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
 MCC_Q         = 0.001
-MCC_R         = 100.0
+MCC_R         = 50.0
 MCC_KERNEL_BW = 1700.0
 MCC_MAXITER   = 5
 
 # ─── PC-UKF-2D ───────────────────────────────────────────────────────
 PCUKF_Q      = 0.001
-PCUKF_R_BASE = 25.0
-PCUKF_R_SCALE = 15.0
-PCUKF_SIGMA  = 300.0
+PCUKF_R_BASE = 50.0
+PCUKF_R_SCALE = 10.0
+PCUKF_SIGMA  = 1.0
 
 # ─── GUKF (Gaussian-smoothed UKF) ────────────────────────────────────
 GUKF_Q      = 0.001
-GUKF_R      = 100.0
+GUKF_R      = 50.0
 GUKF_SIGMA  = 5.0
 GUKF_N_HALF = 4
 
@@ -101,7 +101,7 @@ MOTION_RATIO_MIN = 1.00
 
 # ─── Shared fixed params cho grid search — fair comparison ───────────
 FIXED_Q = 0.001   # process noise — tất cả method dùng chung
-FIXED_R = 50.0    # base measurement noise — tất cả method dùng chung
+FIXED_R = 100.0    # base measurement noise — tất cả method dùng chung
 
 COLLAPSE_PENALTY = 1e9
 
@@ -395,63 +395,45 @@ class MCCUKF:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  5. PC-UKF-2D
+#  5. PC-UKF-2D  (V3 — MAD Auto-Normalized, Sigma-Free)
 # ══════════════════════════════════════════════════════════════════════
-class _KF1D_for_PC:
-    def __init__(self):
-        self.Q = 0.01; self.R = 200.0
-        self.P = 1.0;  self.x = None
+def _pc_scores_v3(innovations, Pzz_diag):
+    """
+    PC Scoring V3 — MAD auto-normalized, sigma-free.
 
-    def update(self, z):
-        if self.x is None:
-            self.x = z
-            return 0.0
-        P_pred  = self.P + self.Q
-        innov   = z - self.x
-        K       = P_pred / (P_pred + self.R)
-        self.x += K * innov
-        self.P  = (1 - K) * P_pred
-        return innov
+    1. Geo-normalize:  std_innov[i] = ν[i] / sqrt(Pzz_diag[i])  ≈ N(0,1) LOS
+    2. MAD normalize:  normed[i] = std_innov[i] / (1.4826·MAD)
+       → tự động scale, không cần tune sigma
+    3. T-kernel (σ=1 cố định): score[i] = mean_j≠i T(normed[i]-normed[j])
+    """
+    std_innov = innovations / np.sqrt(np.maximum(Pzz_diag, 1e-9))
+    med    = np.median(std_innov)
+    mad    = np.median(np.abs(std_innov - med))
+    normed = std_innov / (1.4826 * mad + 1e-9)
 
-
-def pc_consensus_scores(innovations, sigma=PCUKF_SIGMA, d_raw=None):
-    if d_raw is not None:
-        pos_est = LS_position(d_raw)
-        if not np.any(np.isnan(pos_est)):
-            residual = np.zeros(N_ANCHORS)
-            for i, (ax, ay) in enumerate(ANCHORS):
-                d_est = math.sqrt((pos_est[0]-ax)**2 + (pos_est[1]-ay)**2)
-                residual[i] = abs(d_raw[i] - d_est)
-        else:
-            residual = np.abs(innovations)
-    else:
-        residual = np.abs(innovations)
-
+    nu  = 4.0
     scores = np.zeros(N_ANCHORS)
-    eps    = 1e-9
     for i in range(N_ANCHORS):
-        s = 0.0; cnt = 0
-        for j in range(N_ANCHORS):
-            if i == j:
-                continue
-            diff = residual[i] - residual[j]
-            nu   = 4.0
-            c    = (1.0 + (diff**2) / (nu * sigma**2 + eps)) ** (-(nu+1.0)/2.0)
-            s   += c; cnt += 1
-        scores[i] = s / cnt
+        diffs = np.array([normed[i] - normed[j]
+                          for j in range(N_ANCHORS) if j != i])
+        scores[i] = np.mean(
+            (1.0 + diffs**2 / (nu + 1e-9)) ** (-(nu + 1.0) / 2.0)
+        )
     return scores
 
 
 class PCUKF2D:
-    def __init__(self, q=PCUKF_Q, r_base=PCUKF_R_BASE,
-                 r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA):
+    """
+    PC-UKF V3: innovation từ UKF predict step, MAD auto-normalized.
+    Tham số đặc trưng duy nhất cần tune: r_scale.
+    Q và r_base cố định (= FIXED_Q, FIXED_R).
+    """
+    def __init__(self, q=PCUKF_Q, r_base=PCUKF_R_BASE, r_scale=PCUKF_R_SCALE):
         self.n       = 2
         self.Q_mat   = np.eye(2) * q
         self.R_base  = r_base
         self.R_scale = r_scale
-        self.sigma   = sigma
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
-        self._kfs    = [_KF1D_for_PC() for _ in range(N_ANCHORS)]
         self.x = None
         self.P = None
 
@@ -459,34 +441,58 @@ class PCUKF2D:
         self.x = x0.astype(float).copy()
         self.P = np.eye(self.n) * 1e6
 
+    def _z_hat_and_Pzz_diag(self):
+        """Tính z_hat và Pzz diagonal từ sigma points (không update state)."""
+        pts   = sigma_points(self.x, self.P, self.c)
+        Z_pts = np.array([h_obs(pts[i]) for i in range(2*self.n + 1)])
+        z_hat = self.Wm @ Z_pts
+        Pzz_diag = np.full(N_ANCHORS, self.R_base)
+        for i in range(2*self.n + 1):
+            dz = Z_pts[i] - z_hat
+            Pzz_diag += self.Wc[i] * dz**2
+        return z_hat, Pzz_diag
+
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
 
-        innovations = np.array([self._kfs[i].update(z_raw[i])
-                                 for i in range(N_ANCHORS)])
-        scores  = pc_consensus_scores(innovations, self.sigma, d_raw=z_raw)
-        R_diag  = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
-
+        # 1. Predict
         x_pred = self.x.copy()
         P_pred = self.P + self.Q_mat
+        self.x = x_pred
+        self.P = P_pred
 
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
+        # 2. z_hat + Pzz_diag từ sigma points
+        z_hat, Pzz_diag = self._z_hat_and_Pzz_diag()
 
-        R       = np.diag(R_diag)
-        Pzz_eff = Pzz_no_R + R
+        # 3. PC scoring V3 (MAD auto-normalized)
+        innov  = z_raw - z_hat
+        scores = _pc_scores_v3(innov, Pzz_diag)
+        R_diag = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
+
+        # 4. UKF update với R adaptive (full Pzz matrix)
+        pts   = sigma_points(x_pred, P_pred, self.c)
+        Z_pts = np.array([h_obs(pts[i]) for i in range(2*self.n + 1)])
+        z_hat = self.Wm @ Z_pts
+
+        R   = np.diag(R_diag)
+        Pzz = R.copy()
+        Pxz = np.zeros((self.n, N_ANCHORS))
+        for i in range(2*self.n + 1):
+            dz   = Z_pts[i] - z_hat
+            dx   = pts[i] - x_pred
+            Pzz += self.Wc[i] * np.outer(dz, dz)
+            Pxz += self.Wc[i] * np.outer(dx, dz)
 
         try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
+            K = Pxz @ np.linalg.inv(Pzz)
         except np.linalg.LinAlgError:
             self.x = x_pred
             self.P = make_spd(P_pred)
             return self.x.copy()
 
-        innov  = z_raw - z_hat
-        self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.x = x_pred + K @ (z_raw - z_hat)
+        self.P = make_spd(P_pred - K @ Pzz @ K.T)
         return self.x.copy()
 
 
@@ -581,7 +587,7 @@ METHODS = {
     "Huber-UKF" : (HuberUKF,   dict(q=HUBER_Q,     r=HUBER_R,    delta=HUBER_DELTA)),
     "MCC-UKF"   : (MCCUKF,     dict(q=MCC_Q,       r=MCC_R,      kernel_bw=MCC_KERNEL_BW)),
     "PC-UKF-2D" : (PCUKF2D,    dict(q=PCUKF_Q,     r_base=PCUKF_R_BASE,
-                                     r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)),
+                                     r_scale=PCUKF_R_SCALE)),
     "GUKF"      : (GUKF,        dict(q=GUKF_Q,      r=GUKF_R,
                                      sigma=GUKF_SIGMA, n_half=GUKF_N_HALF)),
 }
@@ -815,33 +821,25 @@ def grid_search_mcc(file_paths, gt_xy, expected_path_length):
 
 def grid_search_pcukf(file_paths, gt_xy, expected_path_length):
     """
-    Tune r_scale và sigma — tham số đặc thù của PC.
-    r_base = FIXED_R để so sánh fair.
-    8×8 = 64 combinations, cả hai trục log-spaced.
+    PC-UKF V3 — chỉ tune r_scale (tham số đặc trưng duy nhất).
+    Q=FIXED_Q, r_base=FIXED_R cố định. sigma loại bỏ hoàn toàn (MAD auto).
+    10 điểm log-spaced trên [1, 100].
     """
-    grid = {
-        'r_scale': np.logspace(0, 2, 8).tolist(),          # 1 → 100
-        'sigma'  : np.logspace(np.log10(50), 3, 8).tolist(), # 50 → 1000
-    }
-    keys   = list(grid.keys())
-    combos = list(itertools.product(*[grid[k] for k in keys]))
-    print(f"\n  Grid search PC-UKF-2D: {len(combos)} combinations "
+    r_scales = np.logspace(0, 2, 10).tolist()   # 1 → 100
+    print(f"\n  Grid search PC-UKF-2D (V3, sigma-free): {len(r_scales)} points "
           f"[q={FIXED_Q}, r_base={FIXED_R} fixed]")
     best_rmse = float('inf')
-    best      = dict(q=FIXED_Q, r_base=FIXED_R,
-                     r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA)
-    for combo in combos:
-        params           = dict(zip(keys, combo))
-        params['q']      = FIXED_Q
-        params['r_base'] = FIXED_R
-        rmse = _eval_rmse_single(PCUKF2D, params, file_paths, gt_xy,
-                                  expected_path_length)
+    best      = dict(q=FIXED_Q, r_base=FIXED_R, r_scale=PCUKF_R_SCALE)
+    for r_scale in r_scales:
+        params = dict(q=FIXED_Q, r_base=FIXED_R, r_scale=r_scale)
+        rmse   = _eval_rmse_single(PCUKF2D, params, file_paths, gt_xy,
+                                    expected_path_length)
         if rmse < best_rmse:
             best_rmse = rmse
             best      = params.copy()
     tag = " [⚠ COLLAPSED]" if best_rmse >= COLLAPSE_PENALTY else ""
     print(f"  Best PC-UKF-2D: RMSE={best_rmse:.1f}mm{tag} | "
-          f"r_scale={best['r_scale']:.3f} sigma={best['sigma']:.1f}")
+          f"r_scale={best['r_scale']:.3f}")
     return best
 
 
@@ -881,7 +879,7 @@ def _default_params():
     return (
         dict(q=FIXED_Q, r=FIXED_R, delta=HUBER_DELTA),
         dict(q=FIXED_Q, r=FIXED_R, kernel_bw=MCC_KERNEL_BW),
-        dict(q=FIXED_Q, r_base=FIXED_R, r_scale=PCUKF_R_SCALE, sigma=PCUKF_SIGMA),
+        dict(q=FIXED_Q, r_base=FIXED_R, r_scale=PCUKF_R_SCALE),
         dict(q=FIXED_Q, r=FIXED_R, sigma=GUKF_SIGMA, n_half=GUKF_N_HALF),
     )
 
@@ -1080,14 +1078,13 @@ def loo_tune_and_eval(all_files, gt_xy, expected_path_length):
     print(f"\n{'─'*70}")
     print("  PC-UKF params per fold (verify LOO):")
     print(f"  {'Fold':<6s} {'Test file':<20s} "
-          f"{'R_base':>8s} {'R_scale':>8s} {'sigma':>8s}")
-    print(f"  {'─'*55}")
+          f"{'R_base':>8s} {'R_scale':>8s}")
+    print(f"  {'─'*46}")
     for p in fold_params:
         pc = p['pc']
         print(f"  {p['fold']+1:<6d} {p['test']:<20s} "
               f"{pc.get('r_base', FIXED_R):>8.1f} "
-              f"{pc.get('r_scale', PCUKF_R_SCALE):>8.3f} "
-              f"{pc.get('sigma', PCUKF_SIGMA):>8.1f}")
+              f"{pc.get('r_scale', PCUKF_R_SCALE):>8.3f}")
 
     return (
         {m: np.array(v) for m, v in loo_errors.items()},

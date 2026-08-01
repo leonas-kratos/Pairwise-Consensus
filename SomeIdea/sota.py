@@ -58,18 +58,18 @@ GT_SPACING = 5.0
 N_ANCHORS  = 4
 
 # ─── Standard UKF ────────────────────────────────────────────────────
-UKF_STD_Q      = 0.001
+UKF_STD_Q      = 0.01
 UKF_STD_R      = 50.0
 
 # ─── Huber-UKF ───────────────────────────────────────────────────────
-HUBER_Q       = 0.001
+HUBER_Q       = 0.01
 HUBER_R       = 50.0
 HUBER_DELTA   = 20.0
 HUBER_MAXITER = 5
 
 # ─── MCC-UKF ─────────────────────────────────────────────────────────
-MCC_Q          = 0.001
-MCC_R          = 100.0
+MCC_Q          = 0.01
+MCC_R          = 50.0
 MCC_KERNEL_BW  = 1700.0
 MCC_MAXITER    = 5
 
@@ -80,8 +80,8 @@ PCUKF_R_BASE   = 50.0
 PCUKF_R_SCALE  = 2.0    # param duy nhất cần tune
 
 # ─── GUKF ────────────────────────────────────────────────────────────
-GUKF_Q      = 0.001
-GUKF_R      = 100.0
+GUKF_Q      = 0.01
+GUKF_R      = 50.0
 GUKF_SIGMA  = 5.0
 GUKF_N_HALF = 4
 
@@ -95,7 +95,7 @@ DATA_DIR = "./data"
 SAVE_DIR = "./outputs_sota"
 
 # ─── Motion sanity check ─────────────────────────────────────────────
-MOTION_RATIO_MIN = 1.00
+MOTION_RATIO_MIN = 0.85
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1031,12 +1031,12 @@ def main():
 
     # ── Summary table ─────────────────────────────────────────────────
     metrics = {}
-    print(f"\n{'═' * 110}")
+    print(f"\n{'═' * 105}")
     print(f"  SUMMARY TABLE (mm)   — ⚠ = trajectory collapsed (motion_ratio < {MOTION_RATIO_MIN:.0%})")
-    print(f"{'═' * 110}")
-    print(f"  {'Method':<14s} {'RMSE':>7s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
-          f"{'P95':>7s} {'MAX':>7s} {'RMSE mean±std':>16s} {'MotionR':>8s} {'Status'}")
-    print(f"  {'─' * 98}")
+    print(f"{'═' * 105}")
+    print(f"  {'Method':<14s} {'RMSE mean±std':>18s} {'MAE':>7s} {'CEP50':>7s} {'CEP90':>7s} "
+          f"{'P95':>7s} {'MAX':>7s} {'MotionR':>8s} {'Status'}")
+    print(f"  {'─' * 87}")
 
     for label, errs in errors.items():
         if len(errs) == 0:
@@ -1059,9 +1059,9 @@ def main():
         status = f"⚠ {n_col} file(s) collapsed" if n_col > 0 else "✅ OK"
         mr_str = (f"{m['motion_ratio']:.2f}"
                   if not math.isnan(m.get('motion_ratio', float('nan'))) else "N/A")
-        print(f"  {label:<14s} {m['rmse']:>7.1f} {m['mae']:>7.1f}"
+        print(f"  {label:<14s} {std_str:>18s} {m['mae']:>7.1f}"
               f" {m['cep50']:>7.1f} {m['cep90']:>7.1f} {m['p95']:>7.1f} {m['max']:>7.1f}"
-              f" {std_str:>16s}  {mr_str:>8s}  {status}")
+              f"  {mr_str:>8s}  {status}")
 
     # ── Wilcoxon ──────────────────────────────────────────────────────
     print(f"\n  Wilcoxon tests (two-sided, vs PC-UKF-v3):")

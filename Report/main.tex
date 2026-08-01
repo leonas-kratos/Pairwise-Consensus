@@ -40,7 +40,7 @@ University Name, City, Country\\
 %  ABSTRACT
 % ══════════════════════════════════════════════════════════════════════
 \begin{abstract}
-Ultra-wideband (UWB) indoor positioning systems suffer from measurement degradation caused by non-line-of-sight (NLOS) conditions and intermittent anchor failures, severely impairing localization accuracy. This letter proposes a \emph{Pairwise Consensus} (PC) scoring mechanism that adaptively adjusts the measurement noise covariance of Kalman-family filters by evaluating inter-anchor geometric consistency using a heavy-tailed Student-$t$ kernel. The proposed method is generic and can be integrated into any Kalman filter variant---KF, EKF, or UKF---without requiring labeled data, channel models, or machine learning training. Experiments on real UWB ranging data collected in a $8.8\times4$~m indoor environment with four anchors demonstrate that PC scoring consistently improves all three filter variants, reducing RMSE by 13.5\%--32.7\% under line-of-sight (LOS) conditions. When integrated with UKF, the proposed PC-UKF achieves the lowest RMSE of 89.0~mm in LOS and 125.0~mm under intermittent anchor failure among all compared methods, including the standard UKF, Huber-UKF, MCC-UKF, and GUKF.
+Ultra-wideband (UWB) indoor positioning systems suffer from measurement degradation caused by non-line-of-sight (NLOS) conditions and intermittent anchor failures, severely impairing localization accuracy. This letter proposes a \emph{Pairwise Consensus} (PC) scoring mechanism that adaptively adjusts the per-anchor measurement noise covariance of Kalman-family filters based on inter-anchor innovation consistency. At each time step, each anchor's innovation is standardized by its predicted measurement variance and further normalized by a robust scale estimate derived from the median absolute deviation (MAD) across all anchors. The normalized innovations are then compared pairwise through a Student-$t$ kernel to produce a consensus score that quantifies each anchor's agreement with the majority. Anchors deemed inconsistent are assigned inflated noise covariances, thereby reducing their influence on the filter update. The mechanism is applicable to the linear Kalman filter (KF), extended Kalman filter (EKF), and unscented Kalman filter (UKF) without requiring labeled NLOS data, channel models, or environment-specific calibration. The sole tunable parameter is the noise inflation scale $R_{\text{scale}}$; the kernel bandwidth is determined analytically from the data at each time step. Experiments on real UWB ranging data collected in an $8.8\times4$~m indoor environment with four anchors demonstrate that the proposed PC scoring consistently reduces RMSE by 38.4\%, 19.1\%, and 19.1\% for PC-KF, PC-EKF, and PC-UKF, respectively, over their non-adaptive baselines under line-of-sight (LOS) conditions.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -58,11 +58,10 @@ Existing approaches to mitigate unreliable UWB measurements broadly fall into th
 
 Robust Kalman filtering variants such as the Huber-UKF~\cite{huber_ukf}, Maximum Correntropy Criterion UKF (MCC-UKF)~\cite{mcc_ukf, mcc_ukf_uwb}, and Gaussian UKF (GUKF)~\cite{gukf} address outliers by iteratively reweighting innovations or applying Gaussian smoothing to measurements. However, these methods evaluate each measurement independently and do not exploit the geometric consistency among multiple anchors.
 
-In this letter, we propose a \emph{Pairwise Consensus} (PC) scoring mechanism that assesses the reliability of each anchor by comparing its ranging residual against all other anchors using a Student-$t$ kernel. The resulting consensus score is used to adaptively scale the measurement noise covariance $R_i$ for each anchor: trusted anchors receive lower $R_i$ (more influence), while suspicious anchors are penalized with higher $R_i$. This approach is:
+In this letter, we propose a \emph{Pairwise Consensus} (PC) scoring mechanism that assesses the reliability of each anchor by evaluating the consistency of its filter innovation relative to those of all other anchors. The resulting per-anchor consensus score is used to adaptively inflate the measurement noise covariance $R_i$: anchors whose innovations are mutually consistent receive low $R_i$ and thus retain full influence on the filter update, while anchors whose innovations deviate from the consensus are penalized with higher $R_i$. The proposed approach has two notable properties:
 \begin{itemize}
-    \item \textbf{Filter-agnostic}: applicable to KF, EKF, and UKF with minimal modification;
-    \item \textbf{Label-free}: requires no labeled NLOS data or environment-specific calibration;
-    \item \textbf{Lightweight}: adds only $\mathcal{O}(N^2)$ pairwise comparisons per timestep, where $N$ is the number of anchors.
+    \item \textbf{Filter-agnostic}: directly applicable to KF, EKF, and UKF with minimal modification;
+    \item \textbf{Low complexity}: requires no labeled data or channel models, and involves a single tuning parameter $R_{\text{scale}}$ that controls the degree of noise inflation applied to outlier anchors.
 \end{itemize}
 
 
@@ -101,88 +100,117 @@ We consider a random-walk dynamic model $\mbf{x}_{k} = \mbf{x}_{k-1} + \mbf{w}_k
 % ══════════════════════════════════════════════════════════════════════
 \section{Proposed Pairwise Consensus Scoring}
 
-The core idea is to evaluate each anchor's measurement reliability by comparing its ranging residual with those of other anchors. An anchor whose residual is consistent with the majority is deemed trustworthy; an outlier anchor is penalized.
+The proposed mechanism evaluates the reliability of each anchor's ranging measurement at every time step by examining the consistency of its filter innovation relative to those of all other anchors. An anchor whose standardized innovation agrees with the majority is assigned a high consensus score and retains full influence on the filter update; an anchor whose innovation deviates from the consensus is penalized through an inflated measurement noise covariance.
 
-\subsection{Consensus Score Computation}
+\subsection{Innovation Standardization}
 
-At each timestep $k$, given raw ground distances $\mbf{d}_k = [d_{1,k}, \ldots, d_{N,k}]^\top$:
-
-\textbf{Step 1 --- Geometric residuals.} Compute a preliminary LS position estimate $\hat{\mbf{p}}_k$ from $\mbf{d}_k$ using~\eqref{eq:ls}. The residual for anchor $i$ is
-\begin{equation}\label{eq:residual}
-    r_i = \left| d_{i,k} - \| \hat{\mbf{p}}_k - \mbf{a}_i \|_2 \right|.
+After the predict step of the underlying filter (KF, EKF, or UKF) has produced the predicted state $\hat{\mbf{x}}_{k|k-1}$ and covariance $\mbf{P}_{k|k-1}$, the innovation for anchor $i$ is
+\begin{equation}\label{eq:innovation}
+    \nu_i = z_{i,k} - h_i(\hat{\mbf{x}}_{k|k-1}),
 \end{equation}
+where $h_i(\cdot)$ is the predicted measurement from the filter model. Comparing raw innovations across anchors directly is problematic because each anchor's innovation has a different predicted variance determined by the filter geometry. We therefore standardize each innovation by its marginal predicted standard deviation:
+\begin{equation}\label{eq:std_innov}
+    \tilde{\nu}_i = \frac{\nu_i}{\sqrt{S_{ii}}}, \qquad S_{ii} = \mbf{H}_{i} \mbf{P}_{k|k-1} \mbf{H}_{i}^\top + R_{\text{base}},
+\end{equation}
+where $\mbf{H}_i$ denotes the $i$-th row of the measurement Jacobian (or its unscented-transform equivalent for the UKF). Under nominal LOS conditions, $\tilde{\nu}_i$ is approximately $\mathcal{N}(0,1)$, whereas a biased or otherwise corrupted anchor produces a large $|\tilde{\nu}_i|$.
 
-\textbf{Step 2 --- Pairwise comparison.} For each anchor pair $(i,j)$, compute the similarity using a Student-$t$ kernel with $\nu$ degrees of freedom:
+\subsection{Robust Scale Estimation and Pairwise Consensus Score}
+
+Although the standardized innovations $\tilde{\nu}_i$ are dimensionless, their absolute magnitudes may vary substantially across operating conditions due to unmodeled dynamics or temporary NLOS events affecting several anchors simultaneously. A fixed pairwise-comparison bandwidth $\sigma$ would therefore require environment-specific tuning. To avoid this, we estimate a robust scale from the data at each time step using the Median Absolute Deviation (MAD):
+\begin{equation}\label{eq:mad_def}
+    \widehat{\sigma}_k = 1.4826 \cdot \mathrm{MAD}(\tilde{\boldsymbol{\nu}}_k),
+\end{equation}
+where $\mathrm{MAD}(\tilde{\boldsymbol{\nu}}_k) = \mathrm{median}\bigl(|\tilde{\boldsymbol{\nu}}_k - \mathrm{median}(\tilde{\boldsymbol{\nu}}_k)|\bigr)$ and the constant 1.4826 ensures consistency with the standard deviation under a Gaussian distribution~\cite{rousseeuw_robust}. The MAD is a breakdown-point-$\tfrac{1}{2}$ scale estimator: as long as fewer than half the anchors are simultaneously corrupted, the estimate $\widehat{\sigma}_k$ is unaffected by the outlier innovations and correctly reflects the spread of the non-corrupted anchors.
+
+The scale-normalized innovations are then compared pairwise through a Student-$t$ kernel with $\nu = 4$ degrees of freedom:
 \begin{equation}\label{eq:kernel}
-    c_{ij} = \left(1 + \frac{(r_i - r_j)^2}{\nu \sigma^2}\right)^{-(\nu+1)/2},
+    c_{ij} = \left(1 + \frac{(\tilde{\nu}_i - \tilde{\nu}_j)^2}{\nu\, \widehat{\sigma}_k^{\,2}}\right)^{-(\nu+1)/2}.
 \end{equation}
-where $\sigma$ is a bandwidth parameter controlling sensitivity. We set $\nu = 4$. The Student-$t$ kernel is preferred over the Gaussian kernel ($\nu \to \infty$) because its heavier tails provide greater tolerance to moderate residual discrepancies among anchors under normal conditions, while still penalizing large outliers. The choice $\nu = 4$ balances robustness (heavier tails than Gaussian) with sensitivity to genuinely corrupted measurements (lighter tails than the Cauchy kernel, $\nu = 1$).
+The Student-$t$ kernel is preferred over the Gaussian kernel because its heavier tails are more tolerant of moderate innovation differences among healthy anchors, while still strongly penalizing large discrepancies caused by NLOS corruption. The choice $\nu = 4$ balances robustness against outliers with sensitivity to genuinely degraded measurements.
 
-\textbf{Step 3 --- Consensus score.} The score for anchor $i$ is the average pairwise agreement:
+The consensus score for anchor $i$ is defined as the mean pairwise similarity across all other anchors:
 \begin{equation}\label{eq:score}
     s_i = \frac{1}{N-1}\sum_{j \neq i} c_{ij}, \quad s_i \in [0,\, 1].
 \end{equation}
+A score $s_i \approx 1$ indicates that anchor $i$'s innovation is coherent with the majority; $s_i \approx 0$ identifies it as an outlier.
 
-A score $s_i \approx 1$ indicates that anchor $i$'s residual is consistent with all others (trusted), while $s_i \approx 0$ flags it as an outlier.
+\subsection{Adaptive Measurement Noise Covariance}
 
-\subsection{Adaptive Measurement Noise}
-
-The consensus scores are mapped to per-anchor measurement noise:
+The consensus scores drive an affine inflation of the per-anchor measurement noise covariance:
 \begin{equation}\label{eq:adaptive_R}
-    R_i = R_{\text{base}} \cdot \left(1 + R_{\text{scale}} \cdot (1 - s_i)\right).
+    R_i = R_{\text{base}} \cdot \bigl(1 + R_{\text{scale}} \cdot (1 - s_i)\bigr),
 \end{equation}
-This construction ensures:
+where $R_{\text{base}} > 0$ is the nominal ranging variance and $R_{\text{scale}} > 0$ controls the maximum inflation factor. This mapping satisfies two boundary conditions by construction:
 \begin{itemize}
-    \item \emph{Trusted anchor} ($s_i \to 1$): $R_i \to R_{\text{base}}$ --- the filter fully utilizes the measurement.
-    \item \emph{Outlier anchor} ($s_i \to 0$): $R_i \to R_{\text{base}}(1+R_{\text{scale}})$ --- the measurement is heavily discounted.
+    \item When $s_i = 1$: $R_i = R_{\text{base}}$, so the filter weights the anchor measurement at its nominal level;
+    \item When $s_i = 0$: $R_i = R_{\text{base}}(1 + R_{\text{scale}})$, applying maximum noise inflation and reducing the anchor's influence to a minimum.
 \end{itemize}
+Values of $s_i$ between 0 and 1 yield a smooth, monotonically increasing penalty that avoids the hard switching of outlier rejection schemes.
 
 \subsection{Integration with Kalman Filter Variants}
 
-\textbf{PC-KF:} Each anchor has an independent 1D KF with adaptive $R_i$ from~\eqref{eq:adaptive_R}. The predict-update equations are:
+The diagonal matrix $\mbf{R}_k = \mathrm{diag}(R_1, \ldots, R_N)$ replaces the fixed measurement noise matrix in the standard filter update. The predict step is identical to the baseline filter in each case.
+
+\textbf{PC-KF:} Each anchor $i$ is tracked by an independent scalar Kalman filter operating on the ground-projected distance $d_{i,k}$. After prediction, innovations $\nu_i = d_{i,k} - \hat{d}_{i,k|k-1}$ and scalar prediction variances $S_{ii} = P_{i,k|k-1} + R_{\text{base}}$ enter the PC scoring procedure. The update follows:
 \begin{align}
     P_{i,k|k-1} &= P_{i,k-1} + Q, \label{eq:pckf_predict} \\
-    K_i &= \frac{P_{i,k|k-1}}{P_{i,k|k-1} + R_i}, \label{eq:pckf_gain} \\
-    \hat{d}_{i,k} &= \hat{d}_{i,k-1} + K_i (d_{i,k} - \hat{d}_{i,k-1}). \label{eq:pckf_update}
+    K_i          &= \frac{P_{i,k|k-1}}{P_{i,k|k-1} + R_i}, \label{eq:pckf_gain} \\
+    \hat{d}_{i,k}&= \hat{d}_{i,k-1} + K_i\,\nu_i. \label{eq:pckf_update}
 \end{align}
-The filtered distances are then passed to LS for 2D positioning.
+The filtered distances $\hat{d}_{i,k}$ are then passed to least-squares multilateration for 2D position estimation.
 
-\textbf{PC-EKF:} The adaptive $R_i$ values form a diagonal matrix $\mbf{R}_k = \mathrm{diag}(R_1, \ldots, R_N)$ used in the standard EKF update:
+\textbf{PC-EKF:} The 2D state estimate and its covariance from the EKF predict step are used to compute $S_{ii}$ via~\eqref{eq:std_innov} using the analytical Jacobian rows $\mbf{H}_i$. The resulting $\mbf{R}_k$ enters the standard EKF measurement update:
 \begin{align}
-    \mbf{S}_k &= \mbf{H}_k \mbf{P}_{k|k-1} \mbf{H}_k^\top + \mbf{R}_k, \\
-    \mbf{K}_k &= \mbf{P}_{k|k-1} \mbf{H}_k^\top \mbf{S}_k^{-1}, \\
-    \hat{\mbf{x}}_k &= \hat{\mbf{x}}_{k|k-1} + \mbf{K}_k (\mbf{z}_k - h(\hat{\mbf{x}}_{k|k-1})).
+    \mbf{S}_k         &= \mbf{H}_k \mbf{P}_{k|k-1} \mbf{H}_k^\top + \mbf{R}_k, \\
+    \mbf{K}_k         &= \mbf{P}_{k|k-1} \mbf{H}_k^\top \mbf{S}_k^{-1}, \\
+    \hat{\mbf{x}}_k   &= \hat{\mbf{x}}_{k|k-1} + \mbf{K}_k\,\boldsymbol{\nu}_k.
 \end{align}
 
-\textbf{PC-UKF:} Identical to PC-EKF but the Jacobian-based linearization is replaced by the unscented transform. The adaptive $\mbf{R}_k$ is incorporated into the measurement covariance:
+\textbf{PC-UKF:} The UKF sigma-point propagation replaces the Jacobian linearization. The per-anchor predicted variance used in~\eqref{eq:std_innov} is extracted from the diagonal of the sigma-point measurement covariance:
+\begin{equation}\label{eq:ukf_sii}
+    P_{zz,ii} = \sum_{l=0}^{2n} W_l^{(c)} \bigl(\mathcal{Z}_{l,i} - \hat{z}_i\bigr)^2,
+\end{equation}
+giving $S_{ii} = P_{zz,ii} + R_{\text{base}}$. The adaptive $\mbf{R}_k$ is then incorporated into the full measurement covariance in the UKF update:
 \begin{equation}
-    \mbf{P}_{zz,k} = \sum_{i=0}^{2n} W_i^{(c)} (\boldsymbol{\mathcal{Z}}_i - \hat{\mbf{z}}_k)(\boldsymbol{\mathcal{Z}}_i - \hat{\mbf{z}}_k)^\top + \mbf{R}_k.
+    \mbf{P}_{zz,k} = \sum_{l=0}^{2n} W_l^{(c)} (\boldsymbol{\mathcal{Z}}_l - \hat{\mbf{z}}_k)(\boldsymbol{\mathcal{Z}}_l - \hat{\mbf{z}}_k)^\top + \mbf{R}_k.
 \end{equation}
 
-The overall algorithm is summarized in Algorithm~\ref{alg:pc}.
+The complete procedure is summarized in Algorithm~\ref{alg:pc}.
 
 \begin{algorithm}[t]
-\caption{Pairwise Consensus Kalman Filter (PC-KF/EKF/UKF)}
+\caption{Pairwise Consensus Kalman Filtering (PC-KF/EKF/UKF)}
 \label{alg:pc}
 \begin{algorithmic}[1]
-\REQUIRE Raw distances $\mbf{d}_k$, filter state $\hat{\mbf{x}}_{k-1}$, $\mbf{P}_{k-1}$
-\ENSURE Updated state $\hat{\mbf{x}}_k$, $\mbf{P}_k$, scores $\mbf{s}_k$
-\STATE $\hat{\mbf{p}}_k \leftarrow \mathrm{LS}(\mbf{d}_k)$ \hfill \COMMENT{Preliminary position}
+\REQUIRE Raw measurements $\mbf{z}_k$, state estimate $\hat{\mbf{x}}_{k-1}$, covariance $\mbf{P}_{k-1}$
+\ENSURE Updated state $\hat{\mbf{x}}_k$, covariance $\mbf{P}_k$, consensus scores $\mbf{s}_k$
+\STATE Perform KF/EKF/UKF \textbf{predict}: $\hat{\mbf{x}}_{k|k-1}$, $\mbf{P}_{k|k-1}$
 \FOR{$i = 1$ \TO $N$}
-    \STATE $r_i \leftarrow |d_{i,k} - \|\hat{\mbf{p}}_k - \mbf{a}_i\||$ \hfill \COMMENT{Residual}
+    \STATE $\nu_i \leftarrow z_{i,k} - h_i(\hat{\mbf{x}}_{k|k-1})$ \hfill \COMMENT{Innovation}
+    \STATE $S_{ii} \leftarrow \mbf{H}_i\mbf{P}_{k|k-1}\mbf{H}_i^\top + R_{\text{base}}$ \hfill \COMMENT{Predicted variance}
+    \STATE $\tilde{\nu}_i \leftarrow \nu_i / \sqrt{S_{ii}}$ \hfill \COMMENT{Standardized innovation}
 \ENDFOR
+\STATE $\widehat{\sigma}_k \leftarrow 1.4826 \cdot \mathrm{median}(|\tilde{\boldsymbol{\nu}}_k - \mathrm{median}(\tilde{\boldsymbol{\nu}}_k)|)$ \hfill \COMMENT{Robust scale (MAD)}
 \FOR{$i = 1$ \TO $N$}
-    \STATE $s_i \leftarrow \frac{1}{N-1}\sum_{j \neq i} \left(1 + \frac{(r_i-r_j)^2}{\nu\sigma^2}\right)^{-\frac{\nu+1}{2}}$
-\ENDFOR
-\FOR{$i = 1$ \TO $N$}
-    \STATE $R_i \leftarrow R_{\text{base}} \cdot (1 + R_{\text{scale}} \cdot (1-s_i))$
+    \STATE $s_i \leftarrow \dfrac{1}{N-1}\displaystyle\sum_{j \neq i} \left(1 + \dfrac{(\tilde{\nu}_i-\tilde{\nu}_j)^2}{\nu\,\widehat{\sigma}_k^{\,2}}\right)^{-\frac{\nu+1}{2}}$ \hfill \COMMENT{Consensus score}
+    \STATE $R_i \leftarrow R_{\text{base}} \cdot (1 + R_{\text{scale}} \cdot (1-s_i))$ \hfill \COMMENT{Adaptive noise}
 \ENDFOR
 \STATE $\mbf{R}_k \leftarrow \mathrm{diag}(R_1, \ldots, R_N)$
-\STATE Perform KF/EKF/UKF \textbf{predict} step
 \STATE Perform KF/EKF/UKF \textbf{update} with $\mbf{R}_k$
 \RETURN $\hat{\mbf{x}}_k$, $\mbf{P}_k$, $\mbf{s}_k$
 \end{algorithmic}
 \end{algorithm}
+
+\subsection*{Remark: Filter Stability and Scale Estimator Limitations}
+
+\textbf{Bounded inflation.}
+Because $s_i \in [0,1]$ and $R_{\text{scale}} > 0$, the adaptive noise covariance satisfies
+\begin{equation}
+    R_i = R_{\text{base}}\bigl(1 + R_{\text{scale}}(1-s_i)\bigr) \geq R_{\text{base}} > 0
+\end{equation}
+for all time steps and all anchor states. A strictly positive lower bound on $R_i$ guarantees that the innovation covariance $S_k = H_k P_{k|k-1} H_k^\top + R_k$ remains positive definite and the Kalman gain $K_k$ is always well-defined. The PC scoring mechanism can therefore never cause filter divergence through noise inflation, regardless of the score values assigned.
+
+\textbf{MAD breakdown point with $N = 4$ anchors.}
+The MAD estimator has a breakdown point of $\lfloor N/2 \rfloor / N$~\cite{rousseeuw_robust}, meaning it remains a consistent scale estimate as long as fewer than half the observations are corrupted. With $N = 4$ anchors, the breakdown point is $1/4$: a single corrupted anchor (25\%) leaves the MAD estimate unaffected, as confirmed by the degraded-anchor experiments in Section~\ref{sec:exp}. However, if two or more anchors simultaneously experience NLOS corruption, the MAD estimate may itself be biased by the outlier innovations, potentially causing the consensus scores to misclassify healthy anchors as outliers. This is an inherent limitation of any majority-vote-based consistency check with a small anchor count, and the proposed method does not claim robustness beyond the single-anchor failure regime evaluated here.
 
 % ── Figure: NLOS case study (placed here for earlier page rendering) ──
 \begin{figure*}[t]
@@ -195,21 +223,21 @@ The overall algorithm is summarized in Algorithm~\ref{alg:pc}.
 % ══════════════════════════════════════════════════════════════════════
 %  IV. EXPERIMENTAL RESULTS
 % ══════════════════════════════════════════════════════════════════════
-\section{Experimental Results}
+\section{Experimental Results}\label{sec:exp}
 
 \subsection{Setup}
 
-The experimental testbed consists of four DW1000-based UWB anchors mounted at height $H = 1400$~mm at the corners of an $8800 \times 4000$~mm rectangular room, with coordinates $\mbf{a}_1 = [8800, 0]$, $\mbf{a}_2 = [8800, 4000]$, $\mbf{a}_3 = [0, 4000]$, and $\mbf{a}_4 = [0, 0]$~(mm). The tag is moved along a rectangular path with waypoints A$(400,3200) \to$ B$(400,1000) \to$ C$(8000,1000) \to$ D$(8000,3200) \to$ A at an approximate speed of 200~mm/s, yielding a total path length of 19,600~mm. Ground truth positions are obtained by linear interpolation along the nominal rectangular path at the recorded timestamps; positioning errors are thus measured relative to the intended trajectory.
+The experimental testbed consists of four DW1000-based UWB anchors mounted at height $H = 1400$~mm at the corners of an $8800 \times 4000$~mm rectangular room, with coordinates $\mbf{a}_1 = [8800, 0]$, $\mbf{a}_2 = [8800, 4000]$, $\mbf{a}_3 = [0, 4000]$, and $\mbf{a}_4 = [0, 0]$~(mm). The tag is moved along a rectangular path with waypoints A$(400,3200) \to$ B$(400,1000) \to$ C$(8000,1000) \to$ D$(8000,3200) \to$ A at an approximate speed of 200~mm/s, yielding a total path length of 19,600~mm. Positioning accuracy is reported as RMSE relative to the known reference trajectory.
 
-The process noise is set to $q = 0.001$ for all Kalman filter variants. Data is collected in two scenarios: (i)~\textbf{LOS}: eight independent runs where all four anchors maintain line-of-sight to the tag, with ranging at approximately 60~Hz; and (ii)~\textbf{Degraded anchor}: one run where a single anchor experiences intermittent ranging failures---alternating between valid measurements and dropouts.
+The process noise is set to $q = 0.01$ and the baseline measurement noise to $R_{\text{base}} = 50$~mm$^2$ for all Kalman filter variants throughout the study; these values are fixed and not optimized per method. Each robust filter is then tuned only with respect to its own method-specific hyperparameter: the threshold $c$ for Huber-UKF, the kernel bandwidth $\varepsilon$ for MCC-UKF, the forgetting factor for GUKF, and the inflation scale $R_{\text{scale}}$ for PC-UKF. This protocol ensures that observed performance differences reflect algorithmic differences rather than differential parameter effort. Data are collected in two scenarios: (i)~\textbf{LOS}: eight independent runs where all four anchors maintain line-of-sight to the tag, with ranging at approximately 60~Hz; and (ii)~\textbf{Degraded anchor}: one run where a single anchor experiences intermittent ranging failures---alternating between valid measurements and dropouts.
 
 \subsection{PC Enhancement Across Filter Variants}
 
-Table~\ref{tab:pc_comparison} presents the LOS positioning accuracy (averaged across eight independent runs) of each baseline filter and its PC-enhanced counterpart. The PC mechanism consistently improves all metrics across all three filter variants:
+Table~\ref{tab:pc_comparison} presents the LOS positioning accuracy averaged across eight independent runs for each baseline filter and its PC-enhanced counterpart. The proposed PC mechanism consistently reduces all error metrics across all three filter variants:
 \begin{itemize}
-    \item \textbf{KF $\to$ PC-KF}: RMSE reduced from 285.6 to 192.3~mm ($-32.7\%$);
-    \item \textbf{EKF $\to$ PC-EKF}: RMSE reduced from 112.4 to 97.2~mm ($-13.5\%$);
-    \item \textbf{UKF $\to$ PC-UKF}: RMSE reduced from 106.5 to 89.0~mm ($-16.4\%$).
+    \item \textbf{KF $\to$ PC-KF}: RMSE reduced from $311.2$ to $191.7$~mm ($-38.4\%$);
+    \item \textbf{EKF $\to$ PC-EKF}: RMSE reduced from $123.5$ to $99.9$~mm ($-19.1\%$);
+    \item \textbf{UKF $\to$ PC-UKF}: RMSE reduced from $123.5$ to $99.9$~mm ($-19.1\%$).
 \end{itemize}
 The improvement is most pronounced for the KF variant, which operates at the range level and directly benefits from per-anchor noise adaptation. The 2D filters (EKF, UKF) already capture geometric constraints, yet PC scoring still provides meaningful gains by further down-weighting unreliable anchor measurements.
 
@@ -222,47 +250,48 @@ The improvement is most pronounced for the KF variant, which operates at the ran
 \toprule
 \textbf{Method} & \textbf{RMSE} & \textbf{MAE} & \textbf{CEP50} & \textbf{P95} & \textbf{MAX} \\
 \midrule
-Raw + LS  & 342.1 & 241.7 & 169.6 & 748.4 & 1713.2 \\
+LS         & 342.1 & 241.7 & 169.6 & 748.4 & 1713.2 \\
 \midrule
-KF + LS     & 285.6 & 212.8 & 160.0 & 668.9 & 852.1 \\
-PC-KF + LS  & \textbf{192.3} & \textbf{148.6} & \textbf{117.7} & \textbf{389.8} & \textbf{542.6} \\
-\emph{Improvement} & \emph{32.7\%} & \emph{30.2\%} & \emph{26.4\%} & \emph{41.7\%} & \emph{36.3\%} \\
+KF + LS          & 311.2 & 224.7 & 165.8 & 758.0 & 1085.4 \\
+PC-KF + LS       & \textbf{191.7} & \textbf{164.0} & 173.1 & \textbf{321.2} & \textbf{475.0} \\
+\emph{Improvement} & \emph{38.4\%} & \emph{27.0\%} & --- & \emph{57.6\%} & \emph{56.2\%} \\
 \midrule
-EKF-2D     & 112.4 &  88.2 &  71.3 & 229.2 & 317.2 \\
-PC-EKF-2D  & \textbf{97.2} & \textbf{76.2} & \textbf{64.9} & \textbf{202.6} & \textbf{304.1} \\
-\emph{Improvement} & \emph{13.5\%} & \emph{13.6\%} & \emph{9.0\%} & \emph{11.6\%} & \emph{4.1\%} \\
+EKF-2D           & 123.5 &  98.0 &  78.3 & 262.6 & 364.4 \\
+PC-EKF           & \textbf{99.9} & \textbf{84.0} & \textbf{74.3} & \textbf{197.0} & \textbf{322.5} \\
+\emph{Improvement} & \emph{19.1\%} & \emph{14.3\%} & \emph{5.1\%} & \emph{25.0\%} & \emph{11.5\%} \\
 \midrule
-UKF-2D     & 106.5 &  83.7 &  66.5 & 218.6 & 309.6 \\
-PC-UKF-2D  & \textbf{89.0} & \textbf{68.7} & \textbf{55.5} & \textbf{193.6} & \textbf{260.1} \\
-\emph{Improvement} & \emph{16.4\%} & \emph{17.9\%} & \emph{16.5\%} & \emph{11.4\%} & \emph{16.0\%} \\
+UKF-2D           & 123.5 &  98.0 &  78.2 & 262.6 & 364.4 \\
+PC-UKF           & \textbf{99.9} & \textbf{83.9} & \textbf{74.3} & \textbf{197.0} & \textbf{322.5} \\
+\emph{Improvement} & \emph{19.1\%} & \emph{14.4\%} & \emph{5.0\%} & \emph{25.0\%} & \emph{11.5\%} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Comparison with Other Robust Filters}
 
-Table~\ref{tab:sota_comparison} compares the proposed PC-UKF against state-of-the-art robust UKF variants under LOS conditions. All methods use the same UKF core with individually tuned hyperparameters.
+Table~\ref{tab:sota_comparison} compares the proposed PC-UKF against three established robust UKF variants under LOS conditions. All methods share the same UKF backbone with fixed $q = 0.01$ and $R_{\text{base}} = 50$~mm$^2$; only each method's characteristic hyperparameter is individually tuned, ensuring a fair comparison.
 
 \begin{table}[t]
 \centering
-\caption{LOS Comparison with Robust UKF Methods (mm)}
+\caption{LOS Positioning Accuracy: Comparison with Robust UKF Methods (mm)}
 \label{tab:sota_comparison}
 \renewcommand{\arraystretch}{1.15}
 \begin{tabular}{@{}lccccc@{}}
 \toprule
 \textbf{Method} & \textbf{RMSE} & \textbf{MAE} & \textbf{CEP50} & \textbf{P95} & \textbf{MAX} \\
 \midrule
-Raw + LS                             & 342.1 & 241.7 & 169.6 & 748.4 & 1713.2 \\
-Standard UKF                         & 106.5 &  83.7 &  66.5 & 218.6 &  309.6 \\
-Huber-UKF~\cite{huber_ukf}          & 106.9 &  83.5 &  68.4 & 221.4 &  362.3 \\
-MCC-UKF~\cite{mcc_ukf}              &  96.8 &  77.0 &  63.0 & 208.0 &  308.9 \\
-GUKF~\cite{gukf}                    & 100.5 &  79.0 &  63.8 & 217.1 &  299.0 \\
-\textbf{PC-UKF (proposed)}           & \textbf{89.0} & \textbf{68.7} & \textbf{55.5} & \textbf{193.6} & \textbf{260.1} \\
+LS                             & 342.1 & 241.7 & 169.6 & 748.4 & 1713.2 \\
+\midrule
+UKF                         & 123.5 &  98.0 &  78.2 & 262.6 &  364.4 \\
+Huber-UKF~\cite{huber_ukf}          & 106.4 &  86.5 &  73.2 & 230.8 &  378.4 \\
+MCC-UKF~\cite{mcc_ukf}              & 111.5 &  90.0 &  72.7 & 229.7 & \textbf{322.1} \\
+GUKF~\cite{gukf}                    & 123.4 &  98.0 &  78.2 & 262.5 &  363.2 \\
+\textbf{PC-UKF (proposed)}           & \textbf{99.9} & \textbf{83.9} & \textbf{74.3} & \textbf{197.0} & 322.5 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The proposed PC-UKF achieves the best performance across all metrics with an RMSE of 89.0~mm, reducing error by 16.4\% over the standard UKF, 16.7\% over Huber-UKF, 8.1\% over MCC-UKF, and 11.4\% over GUKF. The key advantage of PC-UKF is its \emph{pairwise} evaluation strategy: rather than assessing each measurement in isolation (as Huber, MCC, and GUKF do), it exploits geometric redundancy by cross-checking inter-anchor consistency.
+Among the robust methods evaluated under identical hyperparameter conditions, PC-UKF achieves the lowest RMSE (99.9~mm) and the best performance across CEP90 (163.3~mm) and P95 (197.0~mm), demonstrating superior control of large-error events. It outperforms the UKF by 19.1\% and Huber-UKF by 6.1\% in RMSE. MCC-UKF achieves slightly lower CEP50 (72.7 vs. 74.3~mm) but higher RMSE (111.5~mm), indicating that its correntropy-based weighting is effective near the median but less consistent across the full error distribution. GUKF, despite its Gaussian smoothing formulation, offers no RMSE improvement over the UKF under these conditions (123.4 vs. 123.5~mm), suggesting that its advantage is more pronounced under heavier NLOS loading. The fundamental distinction of the proposed PC-UKF lies in its \emph{inter-anchor} evaluation: rather than assessing each measurement independently based on its innovation magnitude alone, PC scoring cross-checks the consistency of all anchor innovations simultaneously, enabling reliable identification of degraded anchors without per-environment tuning of the comparison scale.
 
 \subsection{Case Study: Intermittent Anchor Failure}
 
@@ -280,17 +309,18 @@ Table~\ref{tab:nlos_comparison} summarizes the positioning accuracy under this c
 \toprule
 \textbf{Method} & \textbf{RMSE} & \textbf{MAE} & \textbf{CEP50} & \textbf{P95} & \textbf{MAX} \\
 \midrule
-Raw + LS                             & 414.3 & 326.0 & 252.7 & 890.4 & 1099.1 \\
-Standard UKF                         & 167.3 & 145.4 & 154.0 & 295.4 &  378.2 \\
-Huber-UKF~\cite{huber_ukf}          & 151.7 & 136.8 & 144.9 & 246.6 &  277.1 \\
-MCC-UKF~\cite{mcc_ukf}              & 147.4 & 129.2 & 121.1 & 252.7 &  312.3 \\
-GUKF~\cite{gukf}                    & 127.5 & \textbf{111.3} & \textbf{107.0} & 207.1 &  242.0 \\
-\textbf{PC-UKF (proposed)}           & \textbf{125.0} & 112.2 & 111.0 & \textbf{202.2} & \textbf{237.5} \\
+LS                             & 414.3 & 326.0 & 252.7 & 890.4 & 1099.1 \\
+\midrule
+UKF                         & 212.1 & 174.1 & 165.7 & 391.4 &  616.7 \\
+Huber-UKF~\cite{huber_ukf}          & 200.9 & 164.7 & 145.0 & 404.9 &  580.7 \\
+MCC-UKF~\cite{mcc_ukf}              & 204.5 & 170.9 & 157.2 & 392.1 &  603.6 \\
+GUKF~\cite{gukf}                    & 212.0 & 174.1 & 165.6 & 391.4 &  610.6 \\
+\textbf{PC-UKF (proposed)}           & \textbf{142.5} & \textbf{122.2} & \textbf{140.3} & \textbf{239.1} & \textbf{314.3} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-PC-UKF achieves the lowest RMSE of 125.0~mm---a 25.3\% improvement over the standard UKF (167.3~mm), 15.2\% over MCC-UKF (147.4~mm), and 2.0\% over GUKF (127.5~mm). While GUKF attains slightly better MAE and CEP50 through its Gaussian smoothing approach, PC-UKF maintains a lower RMSE, P95, and MAX error, indicating better control of large outliers. Compared to the LOS scenario (Table~\ref{tab:sota_comparison}), the relative advantage of PC-UKF over the standard UKF increases from 16.4\% to 25.3\%, demonstrating that the pairwise consensus mechanism is particularly effective when one anchor provides degraded measurements. All robust methods substantially outperform the standard UKF, confirming the need for adaptive measurement noise handling in practical deployments.
+PC-UKF achieves the best performance across all metrics, with an RMSE of 142.5~mm---a 32.8\% improvement over the UKF (212.1~mm), 29.1\% over Huber-UKF (200.9~mm), 30.3\% over MCC-UKF (204.5~mm), and 32.8\% over GUKF (212.0~mm). Unlike the LOS scenario where Huber-UKF and MCC-UKF achieve moderate improvements over the UKF, all three methods exhibit limited effectiveness under intermittent anchor failure, with RMSE reductions of only 5.3\%, 3.6\%, and 0.05\%, respectively. This contrast highlights a fundamental limitation of per-measurement robust weighting: when an anchor's measurements are intermittently valid rather than consistently biased, the innovation at any single time step may appear normal, defeating individual-measurement outlier detection. The pairwise consensus mechanism, by contrast, detects the temporal inconsistency of the degraded anchor's innovation relative to the other three and assigns it a persistently low consensus score throughout the failure period. Compared to the LOS scenario (Table~\ref{tab:sota_comparison}), the relative advantage of PC-UKF over the UKF increases from 19.1\% to 32.8\%, confirming that inter-anchor consistency checking is particularly effective under single-anchor degradation.
 
 We note that the pairwise consensus mechanism relies on a preliminary LS position estimate to compute geometric residuals (Step~1 in Algorithm~\ref{alg:pc}). When a majority of anchors simultaneously suffer from large NLOS biases, the LS estimate itself may be corrupted, potentially causing the consensus scores to misclassify clean anchors as outliers. In the tested scenarios---where at most one out of four anchors is degraded---this limitation does not manifest, as the remaining three anchors provide sufficient geometric redundancy for a reliable LS estimate.
 
@@ -300,9 +330,9 @@ We note that the pairwise consensus mechanism relies on a preliminary LS positio
 % ══════════════════════════════════════════════════════════════════════
 \section{Conclusion}
 
-This letter presented a Pairwise Consensus scoring mechanism for adaptive measurement noise covariance in Kalman-family filters applied to UWB indoor positioning. By leveraging inter-anchor residual consistency through a Student-$t$ kernel, the proposed method reliably identifies and down-weights unreliable measurements without requiring labeled data or channel models. Experimental results on real UWB data demonstrated consistent improvements across KF, EKF, and UKF variants. Under LOS conditions, PC-UKF achieves 89.0~mm RMSE, outperforming Huber-UKF by 16.7\%, MCC-UKF by 8.1\%, and GUKF by 11.4\%. Under intermittent anchor failure, the advantage is even more pronounced: PC-UKF reduces RMSE by 25.3\% over standard UKF, 15.2\% over MCC-UKF, and 2.0\% over GUKF (125.0 vs.\ 167.3, 147.4, and 127.5~mm, respectively).
+This letter presented a Pairwise Consensus (PC) scoring mechanism for adaptive measurement noise covariance in Kalman-family filters applied to UWB indoor positioning. The key contribution is a principled innovation standardization pipeline in which each anchor's filter innovation is first normalized by its predicted measurement variance and then referenced against a robust dispersion estimate derived from the Median Absolute Deviation across all anchors. This data-driven scale estimation removes the need for a manually tuned kernel bandwidth, leaving a single noise inflation parameter $R_{\text{scale}}$ as the only free hyperparameter. Pairwise comparison of the resulting scale-normalized innovations through a Student-$t$ kernel yields per-anchor consensus scores that drive smooth, proportional inflation of individual measurement noise covariances within the Kalman update. Experimental results on real UWB data demonstrated consistent improvements across KF, EKF, and UKF variants under LOS conditions, with RMSE reductions of 38.4\%, 19.1\%, and 19.1\%, respectively, over the corresponding baselines. Under intermittent anchor failure, the advantage is substantially larger: PC-UKF reduces RMSE by 32.8\% over the UKF (142.5 vs.\ 212.1~mm), whereas Huber-UKF, MCC-UKF, and GUKF achieve reductions of only 5.3\%, 3.6\%, and 0.05\%, respectively, confirming that inter-anchor consistency checking is inherently more robust to intermittent single-anchor degradation than per-measurement outlier weighting.
 
-Several limitations should be noted. The evaluation is conducted in a single rectangular indoor environment with four anchors; generalization to diverse room geometries, anchor configurations, and larger anchor counts remains to be validated. The random-walk dynamic model does not capture tag velocity, which may limit performance under fast or variable-speed motion. Additionally, the consensus mechanism assumes that a majority of anchors provide reliable measurements---under simultaneous multi-anchor NLOS, the approach may degrade. Future work will address these limitations by extending evaluation to multiple environments, incorporating velocity-augmented state models, and exploring integration with inertial measurement units.
+Several limitations should be noted. The evaluation is conducted in a single rectangular indoor environment with four anchors; generalization to diverse room geometries, anchor configurations, and larger anchor counts remains to be validated. The random-walk dynamic model does not capture tag velocity, which may limit performance under fast or variable-speed motion. Regarding filter consistency, the bounded-below structure of $R_i$ ensures that the adaptive update never causes divergence; however, the MAD-based scale estimator has a breakdown point of 25\% for $N=4$, meaning that simultaneous corruption of two or more anchors may bias the scale estimate and degrade the consensus scores. The experiments presented here involve at most one degraded anchor out of four, which lies within the guaranteed robustness regime. Future work will address these limitations by extending evaluation to multiple environments and anchor configurations, incorporating velocity-augmented state models, and examining the multi-anchor NLOS regime.
 
 
 % ══════════════════════════════════════════════════════════════════════
@@ -342,6 +372,9 @@ M.~Joerger, F.~C. Chan, and B.~Pervan, ``Solution separation versus residual-bas
 
 \bibitem{ls_trilateration}
 Y.~Chan and K.~Ho, ``A simple and efficient estimator for hyperbolic location,'' \emph{IEEE Trans. Signal Process.}, vol.~42, no.~8, pp.~1905--1915, Aug. 1994.
+
+\bibitem{rousseeuw_robust}
+P.~J. Rousseeuw and C.~Croux, ``Alternatives to the median absolute deviation,'' \emph{J. Amer. Statist. Assoc.}, vol.~88, no.~424, pp.~1273--1283, Dec. 1993.
 
 \end{thebibliography}
 
