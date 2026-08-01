@@ -239,6 +239,188 @@ def _pc_scores_v3_nb(innovations, Pzz_diag, N, r_base):
     return scores
 
 
+@njit(cache=True)
+def _make_spd_nb(P, eps=1e-9):
+    P = 0.5 * (P + P.T)
+    n = P.shape[0]
+    for i in range(n):
+        P[i, i] += eps
+        if P[i, i] < eps:
+            P[i, i] = eps
+    return P
+
+
+@njit(cache=True)
+def _ukf_moments_nb(x, P, Wm, Wc, c, anchors, anchor_h):
+    """z_hat, Pzz (no R), Pxz từ sigma points — Numba JIT."""
+    n = 2
+    N = anchors.shape[0]
+    n_sig = 2 * n + 1
+    P_spd = _make_spd_nb(P.copy(), 1e-6)
+    S = np.linalg.cholesky(c * P_spd)
+    pts = np.empty((n_sig, n))
+    pts[0, 0] = x[0]; pts[0, 1] = x[1]
+    for i in range(n):
+        pts[i + 1, 0]     = x[0] + S[0, i]
+        pts[i + 1, 1]     = x[1] + S[1, i]
+        pts[n + i + 1, 0] = x[0] - S[0, i]
+        pts[n + i + 1, 1] = x[1] - S[1, i]
+    Z = np.empty((n_sig, N))
+    for i in range(n_sig):
+        for j in range(N):
+            dx = pts[i, 0] - anchors[j, 0]
+            dy = pts[i, 1] - anchors[j, 1]
+            Z[i, j] = math.sqrt(dx*dx + dy*dy + anchor_h*anchor_h)
+    z_hat = np.zeros(N)
+    for i in range(n_sig):
+        for j in range(N):
+            z_hat[j] += Wm[i] * Z[i, j]
+    Pzz = np.zeros((N, N))
+    Pxz = np.zeros((n, N))
+    for i in range(n_sig):
+        for a in range(N):
+            dz_a = Z[i, a] - z_hat[a]
+            for b in range(N):
+                Pzz[a, b] += Wc[i] * dz_a * (Z[i, b] - z_hat[b])
+            for a2 in range(n):
+                Pxz[a2, a] += Wc[i] * (pts[i, a2] - x[a2]) * dz_a
+    return z_hat, Pzz, Pxz
+
+
+@njit(cache=True)
+def _ukf_step_nb(x, P, z_raw, anchors, anchor_h, Q, R, Wm, Wc, c):
+    N = anchors.shape[0]
+    x_pred = x.copy()
+    P_pred = P + np.eye(2) * Q
+    z_hat, Pzz, Pxz = _ukf_moments_nb(x_pred, P_pred, Wm, Wc, c, anchors, anchor_h)
+    for i in range(N):
+        Pzz[i, i] += R
+    innov = z_raw - z_hat
+    K = Pxz @ np.linalg.inv(Pzz)
+    x_new = x_pred + K @ innov
+    P_new = _make_spd_nb(P_pred - K @ Pzz @ K.T)
+    return x_new, P_new
+
+
+@njit(cache=True)
+def _huber_ukf_step_nb(x, P, z_raw, anchors, anchor_h, Q, R_base, delta, maxiter, Wm, Wc, c):
+    N = anchors.shape[0]
+    x_pred = x.copy()
+    P_pred = P + np.eye(2) * Q
+    z_hat, Pzz_no_R, Pxz = _ukf_moments_nb(x_pred, P_pred, Wm, Wc, c, anchors, anchor_h)
+    R_diag = np.full(N, R_base)
+    for _ in range(maxiter):
+        for i in range(N):
+            pzz_ii = Pzz_no_R[i, i] + R_diag[i]
+            if pzz_ii < 1e-9:
+                pzz_ii = 1e-9
+            r_sc = (z_raw[i] - z_hat[i]) / math.sqrt(pzz_ii)
+            ar = abs(r_sc)
+            w = 1.0 if ar <= delta else delta / (ar + 1e-9)
+            if w < 1e-4:
+                w = 1e-4
+            R_diag[i] = R_base / w
+    Pzz = Pzz_no_R.copy()
+    for i in range(N):
+        Pzz[i, i] += R_diag[i]
+    K = Pxz @ np.linalg.inv(Pzz)
+    x_new = x_pred + K @ (z_raw - z_hat)
+    P_new = _make_spd_nb(P_pred - K @ Pzz @ K.T)
+    return x_new, P_new
+
+
+@njit(cache=True)
+def _mcc_ukf_step_nb(x, P, z_raw, anchors, anchor_h, Q, R_base, kernel_bw, maxiter, Wm, Wc, c):
+    N = anchors.shape[0]
+    x_pred = x.copy()
+    P_pred = P + np.eye(2) * Q
+    z_hat, Pzz_no_R, Pxz = _ukf_moments_nb(x_pred, P_pred, Wm, Wc, c, anchors, anchor_h)
+    x_cur = x_pred.copy()
+    R_diag = np.full(N, R_base)
+    K = np.zeros((2, N))
+    innov = z_raw - z_hat
+    for _ in range(maxiter):
+        for i in range(N):
+            w = math.exp(-0.5 * innov[i]*innov[i] / (kernel_bw*kernel_bw + 1e-9))
+            if w < 1e-4:
+                w = 1e-4
+            R_diag[i] = R_base / w
+        Pzz = Pzz_no_R.copy()
+        for i in range(N):
+            Pzz[i, i] += R_diag[i]
+        K = Pxz @ np.linalg.inv(Pzz)
+        x_new = x_pred + K @ innov
+        dx0 = x_new[0] - x_cur[0]
+        dx1 = x_new[1] - x_cur[1]
+        if math.sqrt(dx0*dx0 + dx1*dx1) < 1e-3:
+            x_cur = x_new
+            break
+        x_cur = x_new
+    Pzz = Pzz_no_R.copy()
+    for i in range(N):
+        Pzz[i, i] += R_diag[i]
+    P_new = _make_spd_nb(P_pred - K @ Pzz @ K.T)
+    return x_cur, P_new
+
+
+@njit(cache=True)
+def _pc_ukf_step_nb(x, P, z_raw, anchors, anchor_h, Q, r_base, r_scale, Wm, Wc, c):
+    N = anchors.shape[0]
+    x_pred = x.copy()
+    P_pred = P + np.eye(2) * Q
+    z_hat, Pzz_no_R, Pxz = _ukf_moments_nb(x_pred, P_pred, Wm, Wc, c, anchors, anchor_h)
+    innov = z_raw - z_hat
+    S_diag = np.empty(N)
+    for i in range(N):
+        S_diag[i] = Pzz_no_R[i, i] + r_base
+    scores = _pc_scores_v3_nb(innov, S_diag, N, r_base)
+    Pzz = Pzz_no_R.copy()
+    for i in range(N):
+        Pzz[i, i] += r_base * (1.0 + r_scale * (1.0 - scores[i]))
+    K = Pxz @ np.linalg.inv(Pzz)
+    x_new = x_pred + K @ innov
+    P_new = _make_spd_nb(P_pred - K @ Pzz @ K.T)
+    return x_new, P_new
+
+
+@njit(cache=True)
+def _g_ukf_step_nb(x, P, z_raw, anchors, anchor_h, Q, R, buf, buf_len, kernel, win, Wm, Wc, c):
+    N = anchors.shape[0]
+    if buf_len < win:
+        for j in range(N):
+            buf[buf_len, j] = z_raw[j]
+        buf_len += 1
+    else:
+        for i in range(win - 1):
+            for j in range(N):
+                buf[i, j] = buf[i + 1, j]
+        for j in range(N):
+            buf[win - 1, j] = z_raw[j]
+    z_s = np.zeros(N)
+    if buf_len < win:
+        wsum = 0.0
+        for i in range(buf_len):
+            w = kernel[win - buf_len + i]
+            wsum += w
+            for j in range(N):
+                z_s[j] += w * buf[i, j]
+        for j in range(N):
+            z_s[j] /= (wsum + 1e-18)
+    else:
+        for i in range(win):
+            for j in range(N):
+                z_s[j] += kernel[i] * buf[i, j]
+    x_pred = x.copy()
+    P_pred = P + np.eye(2) * Q
+    z_hat, Pzz, Pxz = _ukf_moments_nb(x_pred, P_pred, Wm, Wc, c, anchors, anchor_h)
+    for i in range(N):
+        Pzz[i, i] += R
+    K = Pxz @ np.linalg.inv(Pzz)
+    x_new = x_pred + K @ (z_s - z_hat)
+    P_new = _make_spd_nb(P_pred - K @ Pzz @ K.T)
+    return x_new, P_new, buf, buf_len
+
+
 def _warmup_numba():
     """Pre-compile tất cả @njit kernels tại import time."""
     _d = np.array([1000.0, 1200.0, 800.0, 900.0])
@@ -248,9 +430,19 @@ def _warmup_numba():
     _innov = np.array([10.0, -5.0, 200.0, 3.0])
     _pzz   = np.array([60.0, 60.0, 60.0, 60.0])
     _pc_scores_v3_nb(_innov, _pzz, 4, 50.0)
+    Wm, Wc, c = ukf_weights(2)
+    _x0 = np.array([2000.0, 2000.0])
+    _P0 = np.eye(2) * 1e6
+    _ukf_step_nb(_x0, _P0, _d, _a, ANCHOR_HEIGHT, 0.01, 50.0, Wm, Wc, c)
+    _huber_ukf_step_nb(_x0, _P0, _d, _a, ANCHOR_HEIGHT, 0.01, 50.0, 20.0, 5, Wm, Wc, c)
+    _mcc_ukf_step_nb(_x0, _P0, _d, _a, ANCHOR_HEIGHT, 0.01, 50.0, 1700.0, 5, Wm, Wc, c)
+    _pc_ukf_step_nb(_x0, _P0, _d, _a, ANCHOR_HEIGHT, 0.01, 50.0, 2.0, Wm, Wc, c)
+    _ker = _make_gaussian_kernel(4, 5.0)
+    _buf = np.zeros((9, 4))
+    _g_ukf_step_nb(_x0, _P0, _d, _a, ANCHOR_HEIGHT, 0.01, 50.0, _buf, 0, _ker, 9, Wm, Wc, c)
 
 
-_warmup_numba()
+# NOTE: ukf_weights / _make_gaussian_kernel defined below — warmup deferred to after them.
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -296,10 +488,11 @@ def ukf_weights(n, alpha=UKF_ALPHA, beta=UKF_BETA, kappa=UKF_KAPPA):
     Wc  = np.full(2*n + 1, 0.5 / c)
     Wm[0] = lam / c
     Wc[0] = lam / c + (1 - alpha**2 + beta)
-    return Wm, Wc, c
+    return Wm.astype(np.float64), Wc.astype(np.float64), float(c)
 
 
 def sigma_points(x, P, c):
+    """Python wrapper — giữ API; hot path dùng _ukf_moments_nb."""
     n = len(x)
     try:
         S = np.linalg.cholesky(c * P)
@@ -314,25 +507,16 @@ def sigma_points(x, P, c):
 
 
 def ukf_measurement_moments(x_pred, P_pred, Wm, Wc, c):
-    pts   = sigma_points(x_pred, P_pred, c)
-    Z_pts = np.array([h_obs(pts[i]) for i in range(len(pts))])
-    z_hat = Wm @ Z_pts
-    n     = len(x_pred)
-    M     = z_hat.shape[0]
-    Pzz   = np.zeros((M, M))
-    Pxz   = np.zeros((n, M))
-    for i in range(2*n + 1):
-        dz   = Z_pts[i] - z_hat
-        dx   = pts[i] - x_pred
-        Pzz += Wc[i] * np.outer(dz, dz)
-        Pxz += Wc[i] * np.outer(dx, dz)
-    return z_hat, Pzz, Pxz
+    return _ukf_moments_nb(
+        np.asarray(x_pred, dtype=np.float64),
+        np.asarray(P_pred, dtype=np.float64),
+        np.asarray(Wm, dtype=np.float64),
+        np.asarray(Wc, dtype=np.float64),
+        float(c), ANCHORS, ANCHOR_HEIGHT)
 
 
 def make_spd(P, eps=1e-9):
-    P = 0.5 * (P + P.T)
-    P += np.eye(len(P)) * eps
-    return P
+    return _make_spd_nb(np.asarray(P, dtype=np.float64).copy(), eps)
 
 
 def default_init(dist_raw_0):
@@ -340,161 +524,102 @@ def default_init(dist_raw_0):
     return pos if not np.any(np.isnan(pos)) else np.array([2000.0, 4400.0])
 
 
+def _make_gaussian_kernel(n_half, sigma):
+    idx = np.arange(-n_half, n_half + 1, dtype=float)
+    h   = np.exp(-0.5 * idx**2 / (sigma**2 + 1e-12))
+    return (h / h.sum()).astype(np.float64)
+
+
+# Warmup sau khi ukf_weights / _make_gaussian_kernel đã có
+_warmup_numba()
+
+
 # ══════════════════════════════════════════════════════════════════════
-#  1. STANDARD UKF
+#  1. STANDARD UKF  (JIT hot path)
 # ══════════════════════════════════════════════════════════════════════
 class StandardUKF:
     def __init__(self, q=UKF_STD_Q, r=UKF_STD_R):
-        self.n     = 2
-        self.Q_mat = np.eye(2) * q
-        self.R_mat = np.eye(N_ANCHORS) * r
+        self.n = 2
+        self.q = float(q)
+        self.r = float(r)
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
-        self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
+        self.x = x0.astype(np.float64).copy()
+        self.P = np.eye(self.n, dtype=np.float64) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q_mat
-
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-
-        Pzz_eff = Pzz_no_R + self.R_mat
-        innov   = z_raw - z_hat
-
-        try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
-        except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
-            return self.x.copy()
-
-        self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.x, self.P = _ukf_step_nb(
+            self.x, self.P, np.asarray(z_raw, dtype=np.float64),
+            ANCHORS, ANCHOR_HEIGHT, self.q, self.r,
+            self.Wm, self.Wc, self.c)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  3. HUBER-UKF
+#  3. HUBER-UKF  (JIT hot path)
 # ══════════════════════════════════════════════════════════════════════
 class HuberUKF:
     def __init__(self, q=HUBER_Q, r=HUBER_R,
                  delta=HUBER_DELTA, maxiter=HUBER_MAXITER):
-        self.n       = 2
-        self.Q_mat   = np.eye(2) * q
-        self.R_base  = r
-        self.delta   = delta
-        self.maxiter = maxiter
+        self.n = 2
+        self.q = float(q)
+        self.r = float(r)
+        self.delta = float(delta)
+        self.maxiter = int(maxiter)
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
-        self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
+        self.x = x0.astype(np.float64).copy()
+        self.P = np.eye(self.n, dtype=np.float64) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q_mat
-
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-
-        R_eff = np.eye(N_ANCHORS) * self.R_base
-        K     = np.zeros((self.n, N_ANCHORS))
-
-        for _ in range(self.maxiter):
-            Pzz_eff  = Pzz_no_R + R_eff
-            innov    = z_raw - z_hat
-            pzz_diag = np.maximum(np.diag(Pzz_eff), 1e-9)
-            r_scaled = innov / np.sqrt(pzz_diag)
-            hub_w    = np.where(
-                np.abs(r_scaled) <= self.delta,
-                1.0,
-                self.delta / (np.abs(r_scaled) + 1e-9)
-            )
-            hub_w = np.maximum(hub_w, 1e-4)
-            R_eff = np.diag(self.R_base / hub_w)
-
-        Pzz_eff = Pzz_no_R + R_eff
-        try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
-        except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
-            return self.x.copy()
-
-        self.x = x_pred + K @ (z_raw - z_hat)
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.x, self.P = _huber_ukf_step_nb(
+            self.x, self.P, np.asarray(z_raw, dtype=np.float64),
+            ANCHORS, ANCHOR_HEIGHT, self.q, self.r,
+            self.delta, self.maxiter, self.Wm, self.Wc, self.c)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  4. MCC-UKF
+#  4. MCC-UKF  (JIT hot path)
 # ══════════════════════════════════════════════════════════════════════
 class MCCUKF:
     def __init__(self, q=MCC_Q, r=MCC_R,
                  kernel_bw=MCC_KERNEL_BW, maxiter=MCC_MAXITER):
-        self.n         = 2
-        self.Q_mat     = np.eye(2) * q
-        self.R_base    = r
-        self.kernel_bw = kernel_bw
-        self.maxiter   = maxiter
+        self.n = 2
+        self.q = float(q)
+        self.r = float(r)
+        self.kernel_bw = float(kernel_bw)
+        self.maxiter = int(maxiter)
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
-        self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
-
-    def _gaussian_kernel(self, r):
-        return np.exp(-0.5 * r**2 / (self.kernel_bw**2 + 1e-9))
+        self.x = x0.astype(np.float64).copy()
+        self.P = np.eye(self.n, dtype=np.float64) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q_mat
-
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-
-        x_cur = x_pred.copy()
-        K     = np.zeros((self.n, N_ANCHORS))
-        R_eff = np.eye(N_ANCHORS) * self.R_base
-
-        for _ in range(self.maxiter):
-            innov  = z_raw - z_hat
-            kern_w = self._gaussian_kernel(innov)
-            kern_w = np.maximum(kern_w, 1e-4)
-            R_eff  = np.diag(self.R_base / kern_w)
-            Pzz_eff = Pzz_no_R + R_eff
-            try:
-                K = Pxz @ np.linalg.inv(Pzz_eff)
-            except np.linalg.LinAlgError:
-                break
-            x_new = x_pred + K @ innov
-            if np.linalg.norm(x_new - x_cur) < 1e-3:
-                x_cur = x_new
-                break
-            x_cur = x_new
-
-        self.x = x_cur
-        self.P = make_spd(P_pred - K @ (Pzz_no_R + R_eff) @ K.T)
+        self.x, self.P = _mcc_ukf_step_nb(
+            self.x, self.P, np.asarray(z_raw, dtype=np.float64),
+            ANCHORS, ANCHOR_HEIGHT, self.q, self.r,
+            self.kernel_bw, self.maxiter, self.Wm, self.Wc, self.c)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  5. PC-UKF-v3 — MAD Auto-Normalized, Sigma-Free
+#  5. PC-UKF-v3 — MAD Auto-Normalized, Sigma-Free  (JIT hot path)
 # ══════════════════════════════════════════════════════════════════════
 def _t_kernel_v3(diff_vec, sigma=1.0):
     """T-distribution kernel với sigma=1.0 cố định."""
@@ -504,189 +629,75 @@ def _t_kernel_v3(diff_vec, sigma=1.0):
 
 
 def pc_scores_v3(innovations, Pzz_diag):
-    """
-    PC Scoring V3 — MAD Auto-Normalized, Sigma-Free.
-
-    Bước 1 — Geo-normalize:
-        std_innov[i] = innovations[i] / sqrt(Pzz_diag[i])
-        → std_innov ≈ N(0,1) khi LOS
-
-    Bước 2 — MAD normalize:
-        mad = median(|std_innov - median(std_innov)|)
-        normed[i] = std_innov[i] / (1.4826 * mad + eps)
-        → tự động scale, loại bỏ hoàn toàn tham số sigma
-
-    Bước 3 — T-kernel với sigma=1.0 cố định:
-        score[i] = mean( T_kernel(normed[i] - normed[j]) ) for j≠i
-    """
-    std_innov = innovations / np.sqrt(np.maximum(Pzz_diag, 1e-9))
-    med    = np.median(std_innov)
-    mad    = np.median(np.abs(std_innov - med))
-    normed = std_innov / (1.4826 * mad + 1e-9)
-    scores = np.zeros(N_ANCHORS)
-    for i in range(N_ANCHORS):
-        diffs     = np.array([normed[i] - normed[j]
-                              for j in range(N_ANCHORS) if j != i])
-        scores[i] = np.mean(_t_kernel_v3(diffs, sigma=1.0))
-    return scores
+    """Python wrapper → _pc_scores_v3_nb (cùng logic)."""
+    return _pc_scores_v3_nb(
+        np.asarray(innovations, dtype=np.float64),
+        np.asarray(Pzz_diag, dtype=np.float64),
+        len(innovations), 50.0)
 
 
 class PCUKFv3:
     """
-    PC-UKF V3: UKF-2D với PC scoring MAD auto-normalized.
+    PC-UKF V3: UKF-2D với PC scoring MAD auto-normalized (JIT).
 
     Cố định: Q=0.01, R_base=50
     Chỉ tune: r_scale
-
-    Pipeline mỗi timestep:
-      1. UKF predict: P_pred = P + Q*I
-      2. Sigma points → propagate qua h_obs → z_hat, Pzz_diag
-         Pzz_diag[i] = sum_k Wc[k]*(Z_pts[k,i]-z_hat[i])^2 + R_base
-      3. innovation ν[i] = z_raw[i] - z_hat[i]
-      4. std_innov[i] = ν[i] / sqrt(Pzz_diag[i])
-      5. MAD normalize → normed[i]
-      6. T-kernel(normed, sigma=1.0 cố định) → score[i] ∈ [0,1]
-      7. R_adaptive[i] = R_base * (1 + r_scale*(1 - score[i]))
-      8. UKF update với R_adaptive (diagonal)
     """
     def __init__(self, q=PCUKF_Q, r_base=PCUKF_R_BASE, r_scale=PCUKF_R_SCALE):
-        self.n       = 2
-        self.Q_mat   = np.eye(2) * q
-        self.R_base  = r_base
-        self.R_scale = r_scale
+        self.n = 2
+        self.q = float(q)
+        self.R_base = float(r_base)
+        self.R_scale = float(r_scale)
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
         self.x = None
         self.P = None
 
     def init(self, x0):
-        self.x = x0.astype(float).copy()
-        self.P = np.eye(self.n) * 1e6
-
-    def _get_z_hat_and_Pzz_diag(self):
-        """Tính z_hat và Pzz diagonal từ sigma points (không update state)."""
-        pts   = sigma_points(self.x, self.P, self.c)
-        Z_pts = np.array([h_obs(pts[i]) for i in range(2*self.n + 1)])
-        z_hat = self.Wm @ Z_pts
-
-        Pzz_diag = np.full(N_ANCHORS, self.R_base)
-        for i in range(2*self.n + 1):
-            dz = Z_pts[i] - z_hat
-            Pzz_diag += self.Wc[i] * dz**2
-        return z_hat, Pzz_diag
+        self.x = x0.astype(np.float64).copy()
+        self.P = np.eye(self.n, dtype=np.float64) * 1e6
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
-
-        # 1. Predict
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q_mat
-        self.x = x_pred
-        self.P = P_pred
-
-        # 2. z_hat + Pzz_diag từ sigma points
-        z_hat, Pzz_diag = self._get_z_hat_and_Pzz_diag()
-
-        # 3. Innovation
-        innov = z_raw - z_hat
-
-        # 4-5-6. PC scoring V3 (MAD auto-normalized, sigma-free)
-        scores  = pc_scores_v3(innov, Pzz_diag)
-
-        # 7. Adaptive R
-        R_diag  = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
-        R_mat   = np.diag(R_diag)
-
-        # 8. UKF update với adaptive R (full Pzz matrix)
-        pts   = sigma_points(x_pred, P_pred, self.c)
-        Z_pts = np.array([h_obs(pts[i]) for i in range(2*self.n + 1)])
-        z_hat_full = self.Wm @ Z_pts
-
-        Pzz = R_mat.copy()
-        Pxz = np.zeros((self.n, N_ANCHORS))
-        for i in range(2*self.n + 1):
-            dz   = Z_pts[i] - z_hat_full
-            dx   = pts[i] - x_pred
-            Pzz += self.Wc[i] * np.outer(dz, dz)
-            Pxz += self.Wc[i] * np.outer(dx, dz)
-
-        try:
-            K = Pxz @ np.linalg.inv(Pzz)
-        except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
-            return self.x.copy()
-
-        self.x = x_pred + K @ (z_raw - z_hat_full)
-        self.P = make_spd(P_pred - K @ Pzz @ K.T)
+        self.x, self.P = _pc_ukf_step_nb(
+            self.x, self.P, np.asarray(z_raw, dtype=np.float64),
+            ANCHORS, ANCHOR_HEIGHT, self.q, self.R_base, self.R_scale,
+            self.Wm, self.Wc, self.c)
         return self.x.copy()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  6. GUKF — Gaussian Unscented Kalman Filter
+#  6. GUKF — Gaussian Unscented Kalman Filter  (JIT hot path)
 # ══════════════════════════════════════════════════════════════════════
-def _make_gaussian_kernel(n_half, sigma):
-    idx = np.arange(-n_half, n_half + 1, dtype=float)
-    h   = np.exp(-0.5 * idx**2 / (sigma**2 + 1e-12))
-    return h / h.sum()
-
-
 class GUKF:
     def __init__(self, q=GUKF_Q, r=GUKF_R,
                  sigma=GUKF_SIGMA, n_half=GUKF_N_HALF):
-        self.n      = 2
-        self.Q_mat  = np.eye(2) * q
-        self.R_mat  = np.eye(N_ANCHORS) * r
+        self.n = 2
+        self.q = float(q)
+        self.r = float(r)
         self.kernel = _make_gaussian_kernel(n_half, sigma)
-        self.n_half = n_half
-        self.win    = 2 * n_half + 1
+        self.n_half = int(n_half)
+        self.win = 2 * self.n_half + 1
         self.Wm, self.Wc, self.c = ukf_weights(self.n)
-        self.x    = None
-        self.P    = None
-        self._buf = []
+        self.x = None
+        self.P = None
+        self._buf = np.zeros((self.win, N_ANCHORS), dtype=np.float64)
+        self._buf_len = 0
 
     def init(self, x0):
-        self.x   = x0.astype(float).copy()
-        self.P   = np.eye(self.n) * 1e6
-        self._buf = []
-
-    def _smooth(self, z_raw):
-        self._buf.append(z_raw.copy())
-        if len(self._buf) > self.win:
-            self._buf.pop(0)
-        buf = np.array(self._buf)
-        L   = len(buf)
-        if L < self.win:
-            h_cut = self.kernel[self.win - L:]
-            h_cut = h_cut / h_cut.sum()
-            return h_cut @ buf
-        else:
-            return self.kernel @ buf
+        self.x = x0.astype(np.float64).copy()
+        self.P = np.eye(self.n, dtype=np.float64) * 1e6
+        self._buf = np.zeros((self.win, N_ANCHORS), dtype=np.float64)
+        self._buf_len = 0
 
     def step(self, z_raw):
         if self.x is None:
             return np.full(2, np.nan)
-
-        z_smooth = self._smooth(z_raw)
-
-        x_pred = self.x.copy()
-        P_pred = self.P + self.Q_mat
-
-        z_hat, Pzz_no_R, Pxz = ukf_measurement_moments(
-            x_pred, P_pred, self.Wm, self.Wc, self.c)
-
-        Pzz_eff = Pzz_no_R + self.R_mat
-        innov   = z_smooth - z_hat
-
-        try:
-            K = Pxz @ np.linalg.inv(Pzz_eff)
-        except np.linalg.LinAlgError:
-            self.x = x_pred
-            self.P = make_spd(P_pred)
-            return self.x.copy()
-
-        self.x = x_pred + K @ innov
-        self.P = make_spd(P_pred - K @ Pzz_eff @ K.T)
+        self.x, self.P, self._buf, self._buf_len = _g_ukf_step_nb(
+            self.x, self.P, np.asarray(z_raw, dtype=np.float64),
+            ANCHORS, ANCHOR_HEIGHT, self.q, self.r,
+            self._buf, self._buf_len, self.kernel, self.win,
+            self.Wm, self.Wc, self.c)
         return self.x.copy()
 
 
