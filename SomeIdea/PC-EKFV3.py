@@ -42,6 +42,7 @@ import time
 import warnings
 import itertools
 import numpy as np
+from numba import njit
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -90,6 +91,303 @@ SAVE_DIR = "./outputs_PCEKF_v3"
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNELS — logic y hệt V3 gốc, chỉ dịch sang @njit
+# ══════════════════════════════════════════════════════════════════════
+@njit(cache=True)
+def _pcekf_step_nb(x, P, z, r_base, r_scale, Q_scalar, anchors):
+    """
+    Một bước PC-EKF V3 hoàn chỉnh: predict + score + update.
+    Logic giống hệt class PCEKF_v3 gốc, chỉ dịch sang Numba.
+    """
+    AH = ANCHOR_HEIGHT
+
+    # ── Predict (giống PCEKF_v3.predict) ──
+    P[0, 0] += Q_scalar
+    P[1, 1] += Q_scalar
+
+    # ── h_obs + jacobian_H (kết hợp 1 vòng cho cache efficiency) ──
+    h  = np.empty(4)
+    Hm = np.empty((4, 2))
+    for i in range(4):
+        dx = x[0] - anchors[i, 0]
+        dy = x[1] - anchors[i, 1]
+        d  = (dx*dx + dy*dy + AH*AH) ** 0.5
+        if d < 1e-6:
+            d = 1e-6
+        h[i]     = d
+        Hm[i, 0] = dx / d
+        Hm[i, 1] = dy / d
+
+    # ── Innovation ──
+    innov = z - h
+
+    # ── S_diag: HP[i] @ H[i] + r_base  (giống einsum('ij,ij->i', HP, H)) ──
+    S_diag = np.empty(4)
+    for i in range(4):
+        s = 0.0
+        for k in range(2):
+            row_k = 0.0
+            for j in range(2):
+                row_k += Hm[i, j] * P[j, k]
+            s += row_k * Hm[i, k]
+        S_diag[i] = s + r_base
+
+    # ── std_innov[i] = innov[i] / sqrt(S_diag[i]) ──
+    std_innov = np.empty(4)
+    for i in range(4):
+        std_innov[i] = innov[i] / (S_diag[i] ** 0.5 + 1e-9)
+
+    # ── MAD normalize (sort-based median cho N=4, không dùng np.median) ──
+    # median của 4 phần tử = trung bình 2 phần tử giữa sau khi sort
+    tmp4 = std_innov.copy()
+    tmp4.sort()
+    med  = (tmp4[1] + tmp4[2]) * 0.5
+
+    abs4 = np.empty(4)
+    for i in range(4):
+        abs4[i] = abs(std_innov[i] - med)
+    abs4.sort()
+    mad = (abs4[1] + abs4[2]) * 0.5
+
+    # Giống V3 gốc: normed = std_innov / (1.4826 * mad + 1e-9)
+    sigma_hat = 1.4826 * mad + 1e-9
+    normed = std_innov / sigma_hat
+
+    # ── Pairwise T-kernel (N=4, unrolled) ──
+    # T-kernel: (1 + d^2/(nu*sigma^2))^(-(nu+1)/2), nu=4, sigma=1.0
+    # = (1 + d^2/4)^(-2.5)  = (1 + d^2 * 0.25)^(-2.5)
+    scores = np.empty(4)
+    for i in range(4):
+        s = 0.0
+        for j in range(4):
+            if j != i:
+                d = normed[i] - normed[j]
+                s += (1.0 + d * d * 0.25) ** (-2.5)
+        scores[i] = s / 3.0   # mean over N-1=3 pairs
+
+    # ── R_adaptive (diagonal) ──
+    R = np.zeros((4, 4))
+    for i in range(4):
+        R[i, i] = r_base * (1.0 + r_scale * (1.0 - scores[i]))
+
+    # ── EKF update: S_mat = H P H^T + R ──
+    HP    = Hm @ P               # (4, 2)
+    S_mat = HP @ Hm.T + R        # (4, 4)
+
+    # Giải S_mat @ X = (H @ P) bằng Gauss-Jordan (njit không có linalg.solve/inv)
+    # K^T = S_mat^{-1} @ (H @ P)  →  K = (H @ P)^T @ S_mat^{-T}
+    HtP = Hm @ P                 # (4, 2)
+    aug = np.empty((4, 6))
+    for i in range(4):
+        for j in range(4):
+            aug[i, j]   = S_mat[i, j]
+        for j in range(2):
+            aug[i, 4+j] = HtP[i, j]
+
+    for col in range(4):
+        # Partial pivoting
+        max_v = abs(aug[col, col])
+        piv   = col
+        for r in range(col + 1, 4):
+            if abs(aug[r, col]) > max_v:
+                max_v = abs(aug[r, col])
+                piv   = r
+        if piv != col:
+            for j in range(6):
+                aug[col, j], aug[piv, j] = aug[piv, j], aug[col, j]
+        dv = aug[col, col]
+        if abs(dv) < 1e-12:
+            dv = 1e-12
+        for j in range(6):
+            aug[col, j] /= dv
+        for r in range(4):
+            if r != col:
+                f = aug[r, col]
+                for j in range(6):
+                    aug[r, j] -= f * aug[col, j]
+
+    # Đọc K: K[i, j] = aug[j, 4+i]  →  K shape (2, 4)
+    K = np.empty((2, 4))
+    for i in range(2):
+        for j in range(4):
+            K[i, j] = aug[j, 4 + i]
+
+    # ── x update: x = x + K @ innov ──
+    Kv = K @ innov
+    x[0] += Kv[0]
+    x[1] += Kv[1]
+
+    # ── P update: P = (I - K H) P ──
+    KH  = K @ Hm
+    IKH = np.eye(2) - KH
+    P[:] = IKH @ P
+
+    return x, P, scores
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNEL — EKF-2D BASELINE (R = R_scalar * I)
+# ══════════════════════════════════════════════════════════════════════
+@njit(cache=True)
+def _ekf2d_step_nb(x, P, z, Q_scalar, R_scalar, anchors):
+    """
+    Một bước EKF-2D chuẩn: predict + update với R = R_scalar * I.
+    Logic giống hệt EKF2D.step() gốc, dịch sang Numba.
+    """
+    AH = ANCHOR_HEIGHT
+
+    # ── Predict ──
+    P[0, 0] += Q_scalar
+    P[1, 1] += Q_scalar
+
+    # ── h_obs + jacobian_H ──
+    h  = np.empty(4)
+    Hm = np.empty((4, 2))
+    for i in range(4):
+        dx = x[0] - anchors[i, 0]
+        dy = x[1] - anchors[i, 1]
+        d  = (dx*dx + dy*dy + AH*AH) ** 0.5
+        if d < 1e-6:
+            d = 1e-6
+        h[i]     = d
+        Hm[i, 0] = dx / d
+        Hm[i, 1] = dy / d
+
+    # ── Innovation ──
+    innov = z - h
+
+    # ── S = H P H^T + R_scalar * I ──
+    HP    = Hm @ P
+    S_mat = HP @ Hm.T
+    for i in range(4):
+        S_mat[i, i] += R_scalar
+
+    # ── Gauss-Jordan solve: aug = [S | HP], K = (HP)^T @ S^{-1} ──
+    aug = np.empty((4, 6))
+    for i in range(4):
+        for j in range(4):
+            aug[i, j]   = S_mat[i, j]
+        for j in range(2):
+            aug[i, 4+j] = HP[i, j]
+
+    for col in range(4):
+        max_v = abs(aug[col, col])
+        piv   = col
+        for r in range(col + 1, 4):
+            if abs(aug[r, col]) > max_v:
+                max_v = abs(aug[r, col])
+                piv   = r
+        if piv != col:
+            for j in range(6):
+                aug[col, j], aug[piv, j] = aug[piv, j], aug[col, j]
+        dv = aug[col, col]
+        if abs(dv) < 1e-12:
+            dv = 1e-12
+        for j in range(6):
+            aug[col, j] /= dv
+        for r in range(4):
+            if r != col:
+                f = aug[r, col]
+                for j in range(6):
+                    aug[r, j] -= f * aug[col, j]
+
+    K = np.empty((2, 4))
+    for i in range(2):
+        for j in range(4):
+            K[i, j] = aug[j, 4 + i]
+
+    # ── x update ──
+    Kv = K @ innov
+    x[0] += Kv[0]
+    x[1] += Kv[1]
+
+    # ── P update: P = (I - K H) P ──
+    KH  = K @ Hm
+    IKH = np.eye(2) - KH
+    P[:] = IKH @ P
+
+    return x, P
+
+
+@njit(cache=True)
+def _ekf2d_file_nb(raw_dist, x0, Q_scalar, R_scalar, anchors):
+    """EKF-2D trên toàn bộ file — full JIT, không cần Python loop."""
+    T   = raw_dist.shape[0]
+    pos = np.empty((T, 2))
+    x   = x0.copy()
+    P   = np.eye(2) * 1e6
+    for t in range(T):
+        x, P = _ekf2d_step_nb(x, P, raw_dist[t], Q_scalar, R_scalar, anchors)
+        pos[t, 0] = x[0]
+        pos[t, 1] = x[1]
+    return pos
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNEL — LS POSITION (batch)
+# ══════════════════════════════════════════════════════════════════════
+@njit(cache=True)
+def _ls_position_nb(distances, anchors):
+    """LS linearized trilateration → 2D position, full Numba."""
+    x0 = anchors[0, 0]
+    y0 = anchors[0, 1]
+    d0 = distances[0]
+    if d0 < 1.0:
+        d0 = 1.0
+    N     = anchors.shape[0]
+    A     = np.empty((N - 1, 2))
+    b_vec = np.empty(N - 1)
+    for i in range(1, N):
+        xi = anchors[i, 0]
+        yi = anchors[i, 1]
+        di = distances[i]
+        if di < 1.0:
+            di = 1.0
+        A[i-1, 0] = 2.0 * (xi - x0)
+        A[i-1, 1] = 2.0 * (yi - y0)
+        b_vec[i-1] = (d0*d0 - di*di) - (x0*x0 - xi*xi) - (y0*y0 - yi*yi)
+    # Giải hệ 2×2: (A^T A) pos = A^T b — phân tích trực tiếp
+    AtA = A.T @ A      # (2, 2)
+    Atb = A.T @ b_vec  # (2,)
+    det = AtA[0, 0] * AtA[1, 1] - AtA[0, 1] * AtA[1, 0]
+    pos = np.empty(2)
+    if abs(det) < 1e-12:
+        pos[0] = np.nan
+        pos[1] = np.nan
+    else:
+        pos[0] = (AtA[1, 1] * Atb[0] - AtA[0, 1] * Atb[1]) / det
+        pos[1] = (AtA[0, 0] * Atb[1] - AtA[1, 0] * Atb[0]) / det
+    return pos
+
+
+@njit(cache=True)
+def _ls_file_nb(dist_mat, anchors):
+    """LS position cho toàn bộ timestep — full JIT loop."""
+    T   = dist_mat.shape[0]
+    pos = np.empty((T, 2))
+    for t in range(T):
+        p = _ls_position_nb(dist_mat[t], anchors)
+        pos[t, 0] = p[0]
+        pos[t, 1] = p[1]
+    return pos
+
+
+def _warmup_numba():
+    """Trigger JIT compilation khi import — tất cả kernels."""
+    _x   = np.array([2000.0, 4400.0])
+    _P   = np.eye(2) * 1e6
+    _z   = np.array([5000.0, 5000.0, 5000.0, 5000.0])
+    _raw = np.ones((2, 4), dtype=np.float64) * 3000.0
+    _ekf2d_file_nb(_raw, _x.copy(), 0.01, 50.0, ANCHORS)
+    _pcekf_step_nb(_x.copy(), _P.copy(), _z, 50.0, 20.0, 0.01, ANCHORS)
+    _ls_file_nb(_raw, ANCHORS)
+
+print("[Numba] Compiling JIT kernels...", end=" ", flush=True)
+_warmup_numba()
+print("done.")
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  GEOMETRY & GROUND TRUTH
 # ══════════════════════════════════════════════════════════════════════
 def slant_to_ground(d_slant):
@@ -117,7 +415,7 @@ def nearest_gt_error(pos_xy, gt_xy):
     return errors
 
 
-def wls_position(distances, anchors=ANCHORS):
+def ls_position(distances, anchors=ANCHORS):
     x0, y0 = anchors[0]
     d0     = max(distances[0], 1.0)
     rows, b = [], []
@@ -320,29 +618,32 @@ class PCEKF_v3:
 #  FILTER WRAPPERS
 # ══════════════════════════════════════════════════════════════════════
 def _init_pos(raw_dist):
-    pos = wls_position(raw_dist[0])
+    pos = ls_position(raw_dist[0])
     return pos if not np.any(np.isnan(pos)) else np.array([2000.0, 4400.0])
 
 
 def ekf2d_filter_file(raw_dist, q=EKF2D_Q, r=EKF2D_R):
-    T   = len(raw_dist)
-    ekf = EKF2D(q=q, r=r)
-    ekf.init(_init_pos(raw_dist))
-    pos = np.full((T, 2), np.nan)
-    for t in range(T):
-        pos[t] = ekf.step(raw_dist[t])
+    """Dùng Numba kernel — logic giống hệt EKF2D Python, full JIT."""
+    x0  = _init_pos(raw_dist).astype(np.float64)
+    pos = _ekf2d_file_nb(
+        raw_dist.astype(np.float64),
+        x0, float(q), float(r), ANCHORS)
     return pos
 
 
 def pcekf_v3_filter_file(raw_dist, q=PCEKF_Q, r_base=PCEKF_R_BASE,
                           r_scale=PCEKF_R_SCALE):
+    """Dùng Numba kernel — kết quả số học giống hệt PCEKF_v3 Python."""
     T    = len(raw_dist)
-    ekf  = PCEKF_v3(q=q, r_base=r_base, r_scale=r_scale)
-    ekf.init(_init_pos(raw_dist))
+    x    = _init_pos(raw_dist).astype(np.float64)
+    P    = np.eye(2) * 1e6
     pos  = np.full((T, 2), np.nan)
     scrs = np.zeros((T, N_ANCHORS))
     for t in range(T):
-        pos[t], scrs[t] = ekf.step(raw_dist[t])
+        x, P, scrs[t] = _pcekf_step_nb(
+            x, P, raw_dist[t].astype(np.float64),
+            float(r_base), float(r_scale), float(q), ANCHORS)
+        pos[t] = x
     return pos, scrs
 
 
@@ -394,7 +695,8 @@ def evaluate_files(file_paths, gt_xy,
         T = len(dist_raw)
 
         # 1. Raw + LS
-        raw_pos = np.array([wls_position(dist_raw[t]) for t in range(T)])
+        dist_f64 = dist_raw.astype(np.float64)
+        raw_pos  = _ls_file_nb(dist_f64, ANCHORS)
 
         # 2. EKF-2D
         t0 = time.perf_counter()

@@ -41,6 +41,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from scipy.stats import wilcoxon
 from scipy.spatial import cKDTree
+from numba import njit
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -113,7 +114,7 @@ def nearest_gt_error(pos_xy, gt_xy):
     return errors
 
 
-def wls_position(distances, anchors=ANCHORS, weights=None):
+def ls_position(distances, anchors=ANCHORS, weights=None):
     x0, y0 = anchors[0]
     d0     = max(distances[0], 1.0)
     rows, b, w = [], [], []
@@ -346,10 +347,100 @@ class PCUKF2D_v3:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNELS
+# ══════════════════════════════════════════════════════════════════════
+
+@njit(cache=True)
+def _ls_position_nb(distances, anchors):
+    """Least-squares position solve (analytical 2×2 closed-form)."""
+    x0 = anchors[0, 0]; y0 = anchors[0, 1]
+    d0 = distances[0]
+    if d0 < 1.0: d0 = 1.0
+    N = anchors.shape[0]
+    A     = np.empty((N - 1, 2))
+    b_vec = np.empty(N - 1)
+    for i in range(1, N):
+        xi = anchors[i, 0]; yi = anchors[i, 1]
+        di = distances[i]
+        if di < 1.0: di = 1.0
+        A[i-1, 0] = 2.0 * (xi - x0)
+        A[i-1, 1] = 2.0 * (yi - y0)
+        b_vec[i-1] = (d0*d0 - di*di) - (x0*x0 - xi*xi) - (y0*y0 - yi*yi)
+    AtA = A.T @ A
+    Atb = A.T @ b_vec
+    det = AtA[0, 0]*AtA[1, 1] - AtA[0, 1]*AtA[1, 0]
+    pos = np.empty(2)
+    if abs(det) < 1e-12:
+        pos[0] = np.nan; pos[1] = np.nan
+    else:
+        pos[0] = (AtA[1, 1]*Atb[0] - AtA[0, 1]*Atb[1]) / det
+        pos[1] = (AtA[0, 0]*Atb[1] - AtA[1, 0]*Atb[0]) / det
+    return pos
+
+
+@njit(cache=True)
+def _ls_file_nb(dist_mat, anchors):
+    """Batch LS position cho toàn bộ file — thay thế list-comprehension."""
+    T   = dist_mat.shape[0]
+    pos = np.empty((T, 2))
+    for t in range(T):
+        p = _ls_position_nb(dist_mat[t], anchors)
+        pos[t, 0] = p[0]; pos[t, 1] = p[1]
+    return pos
+
+
+@njit(cache=True)
+def _pcukf_scores_nb(innov, S_diag, r_base, r_scale):
+    """
+    PC scoring V3 — MAD auto-normalized, T-kernel pairwise.
+    Dùng cho N=4 anchors (even N → median = mean of two middle elements).
+
+    Trả về: (scores, R_adap)
+      scores[i] ∈ [0,1]  — cao = LOS, thấp = NLOS
+      R_adap[i]           — adaptive measurement noise
+    """
+    N = innov.shape[0]
+
+    # Bước 1 — Geo-normalize: std_innov ≈ N(0,1) khi LOS
+    std_innov = np.empty(N)
+    for i in range(N):
+        std_innov[i] = innov[i] / (S_diag[i]**0.5 + 1e-9)
+
+    # Bước 2 — MAD normalize (sort-based, không dùng np.median)
+    tmp = std_innov.copy()
+    tmp.sort()
+    med = (tmp[N//2 - 1] + tmp[N//2]) * 0.5   # N=4 → (tmp[1]+tmp[2])/2
+    abs_dev = np.empty(N)
+    for i in range(N):
+        abs_dev[i] = abs(std_innov[i] - med)
+    abs_dev.sort()
+    mad       = (abs_dev[N//2 - 1] + abs_dev[N//2]) * 0.5
+    sigma_hat = 1.4826 * mad + 1e-9
+    normed    = std_innov / sigma_hat
+
+    # Bước 3 — T-kernel pairwise (nu=4, sigma=1 cố định → exponent = -2.5)
+    scores = np.empty(N)
+    for i in range(N):
+        s = 0.0
+        for j in range(N):
+            if j != i:
+                d = normed[i] - normed[j]
+                s += (1.0 + d*d * 0.25) ** (-2.5)
+        scores[i] = s / (N - 1)
+
+    # Bước 4 — Adaptive R
+    R_adap = np.empty(N)
+    for i in range(N):
+        R_adap[i] = r_base * (1.0 + r_scale * (1.0 - scores[i]))
+
+    return scores, R_adap
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  FILTER WRAPPERS
 # ══════════════════════════════════════════════════════════════════════
 def _init_pos(raw_dist):
-    pos = wls_position(raw_dist[0])
+    pos = ls_position(raw_dist[0])
     return pos if not np.any(np.isnan(pos)) else np.array([2000.0, 4400.0])
 
 
@@ -373,6 +464,39 @@ def pcukf_v3_filter_file(raw_dist, q=PCUKF_Q, r_base=PCUKF_R_BASE,
     scrs = np.zeros((T, N_ANCHORS))
     for t in range(T):
         pos[t], scrs[t], _ = ukf.step(raw_dist[t])
+    return pos, scrs
+
+
+def pcukf_v3_filter_file_nb(raw_dist, q=PCUKF_Q, r_base=PCUKF_R_BASE,
+                             r_scale=PCUKF_R_SCALE,
+                             alpha=UKF2D_ALPHA, beta=UKF2D_BETA, kappa=UKF2D_KAPPA):
+    """
+    Hybrid wrapper: sigma-point propagation trong Python (UKF2D),
+    PC scoring qua JIT kernel _pcukf_scores_nb.
+    Nhanh hơn pcukf_v3_filter_file vì hot-path scoring được compile.
+    Kết quả giống hệt (math tương đương).
+    """
+    T   = len(raw_dist)
+    ukf = UKF2D(q=q, r=r_base, alpha=alpha, beta=beta, kappa=kappa)
+    ukf.init(_init_pos(raw_dist))
+    pos  = np.full((T, 2), np.nan)
+    scrs = np.zeros((T, N_ANCHORS))
+    _rb  = float(r_base)
+    _rs  = float(r_scale)
+    for t in range(T):
+        ukf.predict()
+        if ukf.x is None:
+            continue
+        # Sigma points → z_hat, Pzz_diag (Python UKF)
+        z_hat, Pzz_diag = ukf._get_Pzz_diag(_rb)
+        innov = raw_dist[t] - z_hat
+        # JIT PC scoring
+        sc, R_diag = _pcukf_scores_nb(
+            innov.astype(np.float64),
+            Pzz_diag.astype(np.float64),
+            _rb, _rs)
+        scrs[t] = sc
+        pos[t]  = ukf.update(raw_dist[t], R_diag=R_diag)
     return pos, scrs
 
 
@@ -424,7 +548,7 @@ def evaluate_files(file_paths, gt_xy,
         T = len(dist_raw)
 
         # 1. Raw + LS
-        raw_pos = np.array([wls_position(dist_raw[t]) for t in range(T)])
+        raw_pos = _ls_file_nb(dist_raw.astype(np.float64), ANCHORS)
 
         # 2. UKF-2D
         t0 = time.perf_counter()
@@ -776,6 +900,24 @@ def main():
         np.save(os.path.join(SAVE_DIR, f'errors_{safe}.npy'), errors)
 
     print(f"\n[✓] Toàn bộ kết quả → '{SAVE_DIR}/'")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  NUMBA WARMUP — compile tất cả JIT kernels lúc import
+# ══════════════════════════════════════════════════════════════════════
+def _warmup_numba():
+    """Pre-compile tất cả @njit kernels để tránh latency lần đầu tiên."""
+    _anch = ANCHORS.copy()
+    _d    = np.array([5000.0, 5000.0, 5000.0, 5000.0])
+    _ls_position_nb(_d, _anch)
+    _ls_file_nb(np.tile(_d, (2, 1)), _anch)
+    _innov  = np.array([10.0, -5.0, 20.0, -15.0])
+    _S_diag = np.array([60.0,  55.0, 65.0,  58.0])
+    _pcukf_scores_nb(_innov, _S_diag, 50.0, 10.0)
+    print("[Numba] JIT warmup hoàn tất (LS + PC-UKF scoring).")
+
+
+_warmup_numba()
 
 
 if __name__ == "__main__":

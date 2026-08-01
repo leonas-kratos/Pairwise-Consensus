@@ -84,7 +84,7 @@ PCEKF_Q       = 0.01
 PCEKF_R_BASE  = 50.0
 PCEKF_R_SCALE = 30.0   # ← PARAM DUY NHẤT CẦN TUNE (thử 2 → 30)
 
-DO_GRID_SEARCH = False
+DO_GRID_SEARCH = True
 DATA_DIR = "./data"
 SAVE_DIR = "./outputs_PCEKF_v3"
 
@@ -197,7 +197,6 @@ def pc_scores_v3(innovations, S_diag):
     med       = np.median(std_innov)
     mad       = np.median(np.abs(std_innov - med))
     normed    = std_innov / (1.4826 * mad + 1e-9)
-
     # Bước 3: pairwise T-kernel, sigma=1.0 cố định
     scores = np.zeros(N_ANCHORS)
     for i in range(N_ANCHORS):

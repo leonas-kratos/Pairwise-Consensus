@@ -24,6 +24,7 @@ import time
 import warnings
 import itertools
 import numpy as np
+from numba import njit
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -144,6 +145,112 @@ def LS_position(distances, anchors=ANCHORS, weights=None):
         return pos
     except Exception:
         return np.array([np.nan, np.nan])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNELS
+# ══════════════════════════════════════════════════════════════════════
+@njit(cache=True)
+def _ls_position_nb(distances, anchors):
+    """Giải LS position (closed-form 2×2, không dùng np.linalg.inv)."""
+    x0 = anchors[0, 0]; y0 = anchors[0, 1]
+    d0 = distances[0]
+    if d0 < 1.0: d0 = 1.0
+    N = anchors.shape[0]
+    A = np.empty((N - 1, 2))
+    b_vec = np.empty(N - 1)
+    for i in range(1, N):
+        xi = anchors[i, 0]; yi = anchors[i, 1]
+        di = distances[i]
+        if di < 1.0: di = 1.0
+        A[i-1, 0] = 2.0 * (xi - x0)
+        A[i-1, 1] = 2.0 * (yi - y0)
+        b_vec[i-1] = (d0*d0 - di*di) - (x0*x0 - xi*xi) - (y0*y0 - yi*yi)
+    AtA = A.T @ A
+    Atb = A.T @ b_vec
+    det = AtA[0, 0]*AtA[1, 1] - AtA[0, 1]*AtA[1, 0]
+    pos = np.empty(2)
+    if abs(det) < 1e-12:
+        pos[0] = np.nan; pos[1] = np.nan
+    else:
+        pos[0] = (AtA[1, 1]*Atb[0] - AtA[0, 1]*Atb[1]) / det
+        pos[1] = (AtA[0, 0]*Atb[1] - AtA[1, 0]*Atb[0]) / det
+    return pos
+
+
+@njit(cache=True)
+def _ls_file_nb(dist_mat, anchors):
+    """Batch LS cho toàn bộ file: dist_mat (T, N) → pos (T, 2)."""
+    T = dist_mat.shape[0]
+    pos = np.empty((T, 2))
+    for t in range(T):
+        p = _ls_position_nb(dist_mat[t], anchors)
+        pos[t, 0] = p[0]; pos[t, 1] = p[1]
+    return pos
+
+
+@njit(cache=True)
+def _pc_scores_v3_nb(innovations, Pzz_diag, N, r_base):
+    """
+    PC scoring V3 — MAD Auto-Normalized, Sigma-Free — Numba JIT.
+    innovations : (N,)  — innovation vector
+    Pzz_diag    : (N,)  — diagonal of Pzz
+    N           : int   — number of anchors
+    r_base      : float — base measurement noise
+
+    Bước 1: geo-normalize
+    Bước 2: MAD normalize (sort-based, không dùng np.median)
+    Bước 3: T-kernel pairwise (nu=4, sigma=1 cố định)
+    """
+    # Bước 1: geo-normalize
+    std_innov = np.empty(N)
+    for i in range(N):
+        denom = Pzz_diag[i]
+        if denom < 1e-9: denom = 1e-9
+        std_innov[i] = innovations[i] / (denom ** 0.5)
+
+    # Bước 2: MAD normalize (sort-based, Numba-compatible)
+    tmp = std_innov.copy(); tmp.sort()
+    if N % 2 == 0:
+        med = (tmp[N//2 - 1] + tmp[N//2]) * 0.5
+    else:
+        med = tmp[N//2]
+    abs_dev = np.empty(N)
+    for i in range(N): abs_dev[i] = abs(std_innov[i] - med)
+    abs_dev.sort()
+    if N % 2 == 0:
+        mad = (abs_dev[N//2 - 1] + abs_dev[N//2]) * 0.5
+    else:
+        mad = abs_dev[N//2]
+    sigma_hat = 1.4826 * mad + 1e-9
+    normed = np.empty(N)
+    for i in range(N): normed[i] = std_innov[i] / sigma_hat
+
+    # Bước 3: T-kernel pairwise (nu=4, sigma=1 cố định)
+    nu = 4.0; eps = 1e-9
+    scores = np.empty(N)
+    for i in range(N):
+        s = 0.0
+        for j in range(N):
+            if j != i:
+                d = normed[i] - normed[j]
+                s += (1.0 + d*d / (nu * 1.0 + eps)) ** (-(nu + 1.0) * 0.5)
+        scores[i] = s / (N - 1)
+    return scores
+
+
+def _warmup_numba():
+    """Pre-compile tất cả @njit kernels tại import time."""
+    _d = np.array([1000.0, 1200.0, 800.0, 900.0])
+    _a = ANCHORS.copy()
+    _ls_position_nb(_d, _a)
+    _ls_file_nb(np.stack([_d]), _a)
+    _innov = np.array([10.0, -5.0, 200.0, 3.0])
+    _pzz   = np.array([60.0, 60.0, 60.0, 60.0])
+    _pc_scores_v3_nb(_innov, _pzz, 4, 50.0)
+
+
+_warmup_numba()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -678,7 +785,8 @@ def evaluate_files(file_paths, gt_xy, expected_path_length):
 
         for name, method in METHODS.items():
             if method is None:
-                pos = np.array([LS_position(dist_raw[t]) for t in range(T)])
+                # Raw+LS: JIT batch — nhanh hơn list comprehension Python
+                pos = _ls_file_nb(dist_raw.astype(np.float64), ANCHORS)
             else:
                 filt_cls, kwargs = method
                 t0  = time.perf_counter()

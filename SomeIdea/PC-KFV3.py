@@ -35,6 +35,7 @@ import time
 import warnings
 import itertools
 import numpy as np
+from numba import njit
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -83,6 +84,183 @@ SAVE_DIR = "./outputs_PCKF_v3"
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNELS
+# ══════════════════════════════════════════════════════════════════════
+@njit(cache=True)
+def _kf_file_nb(raw_dist, q, r):
+    """
+    KF 1D per-anchor trên toàn bộ file.
+    Logic giống hệt kf_filter_file + KF1D.update gốc.
+    """
+    T = raw_dist.shape[0]
+    N = raw_dist.shape[1]
+    d_kf = np.zeros((T, N))
+    x    = np.zeros(N)
+    P    = np.ones(N)
+    init = np.zeros(N, dtype=np.bool_)
+
+    for t in range(T):
+        for i in range(N):
+            z = raw_dist[t, i]
+            if not init[i]:
+                x[i]    = z
+                init[i] = True
+                d_kf[t, i] = z
+            else:
+                P_pred     = P[i] + q
+                innovation = z - x[i]
+                K          = P_pred / (P_pred + r)
+                x[i]      += K * innovation
+                P[i]       = (1.0 - K) * P_pred
+                d_kf[t, i] = x[i]
+    return d_kf
+
+
+@njit(cache=True)
+def _pckf_step_nb(x, P, d_raw, q, r_base, r_scale):
+    """
+    Một bước PC-KF V3: predict + score + update cho 4 anchor.
+    Logic giống hệt PCKF_v3.update gốc.
+    """
+    N = 4
+
+    # 1. Predict
+    P_pred = P + q                          # (N,)
+
+    # 2. Innovation
+    innov = d_raw - x                       # (N,)
+
+    # 3. S_diag = P_pred + r_base
+    S_diag = P_pred + r_base               # (N,)
+
+    # 4. std_innov
+    std_innov = np.empty(N)
+    for i in range(N):
+        std_innov[i] = innov[i] / (S_diag[i] ** 0.5 + 1e-9)
+
+    # 5. MAD normalize (sort-based median, N=4)
+    tmp4 = std_innov.copy()
+    tmp4.sort()
+    med  = (tmp4[1] + tmp4[2]) * 0.5
+
+    abs4 = np.empty(N)
+    for i in range(N):
+        abs4[i] = abs(std_innov[i] - med)
+    abs4.sort()
+    mad = (abs4[1] + abs4[2]) * 0.5
+
+    sigma_hat = 1.4826 * mad + 1e-9
+    normed = std_innov / sigma_hat
+
+    # 6. Pairwise T-kernel (nu=4, sigma=1.0)
+    #    kernel(d) = (1 + d^2/4)^(-2.5)
+    scores = np.empty(N)
+    for i in range(N):
+        s = 0.0
+        for j in range(N):
+            if j != i:
+                d = normed[i] - normed[j]
+                s += (1.0 + d * d * 0.25) ** (-2.5)
+        scores[i] = s / 3.0
+
+    # 7. Adaptive R
+    R_adap = np.empty(N)
+    for i in range(N):
+        R_adap[i] = r_base * (1.0 + r_scale * (1.0 - scores[i]))
+
+    # 8. KF update
+    K = P_pred / (P_pred + R_adap)
+    x = x + K * innov
+    P = (1.0 - K) * P_pred
+
+    return x, P, scores
+
+
+@njit(cache=True)
+def _pckf_file_nb(raw_dist, q, r_base, r_scale):
+    """
+    PC-KF V3 trên toàn bộ file.
+    Logic giống hệt pckf_v3_filter_file + PCKF_v3.update gốc.
+    """
+    T = raw_dist.shape[0]
+    N = raw_dist.shape[1]
+    d_kf = np.zeros((T, N))
+    scrs = np.zeros((T, N))
+
+    # Khởi tạo (timestep đầu tiên)
+    x = raw_dist[0].copy()
+    P = np.ones(N)
+    d_kf[0] = x
+    scrs[0] = np.ones(N)
+
+    for t in range(1, T):
+        x, P, scrs[t] = _pckf_step_nb(x, P, raw_dist[t], q, r_base, r_scale)
+        d_kf[t] = x
+
+    return d_kf, scrs
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  NUMBA JIT KERNEL — LS POSITION (batch)
+# ══════════════════════════════════════════════════════════════════════
+@njit(cache=True)
+def _ls_position_nb(distances, anchors):
+    """LS linearized trilateration → 2D position, full Numba."""
+    x0 = anchors[0, 0]
+    y0 = anchors[0, 1]
+    d0 = distances[0]
+    if d0 < 1.0:
+        d0 = 1.0
+    N     = anchors.shape[0]
+    A     = np.empty((N - 1, 2))
+    b_vec = np.empty(N - 1)
+    for i in range(1, N):
+        xi = anchors[i, 0]
+        yi = anchors[i, 1]
+        di = distances[i]
+        if di < 1.0:
+            di = 1.0
+        A[i-1, 0] = 2.0 * (xi - x0)
+        A[i-1, 1] = 2.0 * (yi - y0)
+        b_vec[i-1] = (d0*d0 - di*di) - (x0*x0 - xi*xi) - (y0*y0 - yi*yi)
+    # Giải hệ 2×2: (A^T A) pos = A^T b — phân tích trực tiếp
+    AtA = A.T @ A      # (2, 2)
+    Atb = A.T @ b_vec  # (2,)
+    det = AtA[0, 0] * AtA[1, 1] - AtA[0, 1] * AtA[1, 0]
+    pos = np.empty(2)
+    if abs(det) < 1e-12:
+        pos[0] = np.nan
+        pos[1] = np.nan
+    else:
+        pos[0] = (AtA[1, 1] * Atb[0] - AtA[0, 1] * Atb[1]) / det
+        pos[1] = (AtA[0, 0] * Atb[1] - AtA[1, 0] * Atb[0]) / det
+    return pos
+
+
+@njit(cache=True)
+def _ls_file_nb(dist_mat, anchors):
+    """LS position cho toàn bộ timestep — full JIT loop."""
+    T   = dist_mat.shape[0]
+    pos = np.empty((T, 2))
+    for t in range(T):
+        p = _ls_position_nb(dist_mat[t], anchors)
+        pos[t, 0] = p[0]
+        pos[t, 1] = p[1]
+    return pos
+
+
+def _warmup_numba():
+    _raw = np.ones((2, 4), dtype=np.float64) * 3000.0
+    _kf_file_nb(_raw, 0.01, 50.0)
+    _pckf_file_nb(_raw, 0.01, 50.0, 10.0)
+    _ls_file_nb(_raw, ANCHORS)
+
+print("[Numba] Compiling JIT kernels...", end=" ", flush=True)
+_warmup_numba()
+print("done.")
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  GEOMETRY & GROUND TRUTH
 # ══════════════════════════════════════════════════════════════════════
 def slant_to_ground(d_slant):
@@ -110,7 +288,7 @@ def nearest_gt_error(pos_xy, gt_xy):
     return errors
 
 
-def wls_position(distances, anchors=ANCHORS):
+def ls_position(distances, anchors=ANCHORS):
     x0, y0 = anchors[0]
     d0     = max(distances[0], 1.0)
     rows, b = [], []
@@ -251,26 +429,18 @@ class PCKF_v3:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  FILTER WRAPPERS
+#  FILTER WRAPPERS — dùng Numba kernel
 # ══════════════════════════════════════════════════════════════════════
 def kf_filter_file(raw_dist, q=KF_Q, r=KF_R):
-    T   = len(raw_dist)
-    kfs = [KF1D(q=q, r=r) for _ in range(N_ANCHORS)]
-    d_kf = np.zeros_like(raw_dist)
-    for t in range(T):
-        for i in range(N_ANCHORS):
-            d_kf[t, i], _ = kfs[i].update(raw_dist[t, i])
+    d_kf = _kf_file_nb(raw_dist.astype(np.float64), float(q), float(r))
     return d_kf.astype(np.float32)
 
 
 def pckf_v3_filter_file(raw_dist, q=PCKF_Q, r_base=PCKF_R_BASE,
                          r_scale=PCKF_R_SCALE):
-    T    = len(raw_dist)
-    kf   = PCKF_v3(q=q, r_base=r_base, r_scale=r_scale)
-    d_kf = np.zeros_like(raw_dist)
-    scrs = np.zeros_like(raw_dist)
-    for t in range(T):
-        d_kf[t], scrs[t] = kf.update(raw_dist[t])
+    d_kf, scrs = _pckf_file_nb(
+        raw_dist.astype(np.float64),
+        float(q), float(r_base), float(r_scale))
     return d_kf.astype(np.float32), scrs.astype(np.float32)
 
 
@@ -321,20 +491,22 @@ def evaluate_files(file_paths, gt_xy,
         dist_raw = parsed['dist']
         T = len(dist_raw)
 
+        dist_f64 = dist_raw.astype(np.float64)
+
         # 1. Raw + LS
-        raw_pos = np.array([wls_position(dist_raw[t]) for t in range(T)])
+        raw_pos = _ls_file_nb(dist_f64, ANCHORS)
 
         # 2. KF + LS
         t0 = time.perf_counter()
         d_kf   = kf_filter_file(dist_raw)
-        kf_pos = np.array([wls_position(d_kf[t]) for t in range(T)])
+        kf_pos = _ls_file_nb(d_kf.astype(np.float64), ANCHORS)
         t1 = time.perf_counter()
 
         # 3. PC-KF-v3 + LS
         d_pckf, _ = pckf_v3_filter_file(
             dist_raw, q=pckf_q, r_base=pckf_r_base,
             r_scale=pckf_r_scale)
-        pckf_pos = np.array([wls_position(d_pckf[t]) for t in range(T)])
+        pckf_pos = _ls_file_nb(d_pckf.astype(np.float64), ANCHORS)
         t2 = time.perf_counter()
 
         def filt(p): return p[~np.any(np.isnan(p), axis=1)]
