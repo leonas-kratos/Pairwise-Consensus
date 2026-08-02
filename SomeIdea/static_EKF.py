@@ -755,6 +755,10 @@ def plot_scatter(all_pos, per_file, env_name, save_path):
     ax.legend(fontsize=8, loc='best', markerscale=3)
     ax.grid(True, ls='--', alpha=0.3)
     ax.set_aspect('equal')
+    
+    ax.set_xlim(6200, 6800)
+    ax.set_ylim(700, 900)
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"[✓] Scatter → {save_path}")
@@ -891,11 +895,11 @@ def main():
             rmse  = np.sqrt(np.mean(errs**2)) if len(errs) > 0 else float('nan')
             color = method_colors[method_name]
             ax.scatter(valid[:, 0], valid[:, 1],
-                       s=4, color=color, alpha=0.45,
+                       s=8, color=color, alpha=1.0,
                        label=f"{method_name}  {rmse:.1f}mm")
 
         # GT star
-        ax.scatter(gx, gy, s=180, marker='*', color='red',
+        ax.scatter(gx, gy, s=30, marker='*', color='red',
                    zorder=10, label=f"GT ({gx}, {gy})")
 
         # Anchors
@@ -911,6 +915,8 @@ def main():
         ax.legend(fontsize=8, loc='best', markerscale=3)
         ax.grid(True, ls='--', alpha=0.3)
         ax.set_aspect('equal')
+        ax.set_xlim(6200, 6800)
+        ax.set_ylim(700, 1200)
 
     # Ẩn axes thừa
     for idx in range(n_pts, nrows * ncols):

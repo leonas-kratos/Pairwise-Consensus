@@ -18,6 +18,7 @@ Format input mỗi dòng:
 import sys, math, time, signal, csv, argparse, re
 import numpy as np
 from numba import njit
+from _robot_mixin import start_robot, stop_robot
 
 # ══════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -194,6 +195,7 @@ def run(port, baud, log_file):
         print(f"[ERROR] {e}"); sys.exit(1)
 
     print(f"OK. Đang chờ dữ liệu... (Ctrl+C để dừng)\n")
+    start_robot()
     print(f"{'Time(s)':>8}  {'Frame':>6}  {'X(mm)':>9}  {'Y(mm)':>9}  {'dt(ms)':>7}")
     print("-" * 50)
 
@@ -235,6 +237,7 @@ def run(port, baud, log_file):
         except KeyboardInterrupt:
             pass
         finally:
+            stop_robot()
             ser.close()
             print(f"\n[✓] Dừng. {frame_n} frames. Log → {log_file}")
 
@@ -257,6 +260,7 @@ def demo():
         gt_pts.append(WAYPOINTS[idx] + frac * segs[idx])
 
     x = None; P = np.eye(2) * 1e6; errors = []
+    start_robot()
     print(f"{'Step':>5}  {'X(mm)':>9}  {'Y(mm)':>9}  {'Err(mm)':>8}  dt(µs)")
     print("-" * 50)
 
@@ -286,6 +290,7 @@ def demo():
     errors = np.array(errors)
     print(f"\nRMSE={np.sqrt(np.mean(errors**2)):.1f}mm  "
           f"MAE={np.mean(errors):.1f}mm  P95={np.percentile(errors,95):.1f}mm")
+    stop_robot()
 
 
 # ══════════════════════════════════════════════════════════════════════
