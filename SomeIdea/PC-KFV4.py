@@ -1,31 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-UWB Indoor Positioning — PC-EKF-2D (sotaPC — Gaussian Pairwise Consistency)
-=============================================================================
-PC scoring theo cơ chế của sotaV2 (PC-UKF-v4):
-  - Innovation từ EKF predict step: ν[i] = z[i] - h_i(x̂_pred)
-  - S_ii = H_i @ P_pred @ H_i^T + R_base        (per-anchor prediction variance)
-  - nm[i] = ν[i] / sqrt(S_ii)                   → chuẩn hóa ~ N(0,1) nếu inlier
+UWB Indoor Positioning — PC-KF (V3 — Gaussian Pairwise Consistency, Sigma-Free)
+=================================================================================
+PC scoring theo cơ chế của sotaV2 (PC-EKF-V4):
+  - Innovation từ KF predict step: ν[i] = z[i] - x̂[i]
+  - S_ii = P_pred[i] + R_base                         (per-anchor prediction variance)
+  - nm[i] = ν[i] / sqrt(S_ii)                         → chuẩn hóa ~ N(0,1) nếu inlier
   - Pairwise Gaussian kernel: score[i] = mean exp(-0.25*(nm[i]-nm[j])²) for j≠i
     (variance=2 vì diff hai N(0,1))
   - R_adaptive[i] = R_base * (1 + r_scale*(1 - score[i]))
-  - EKF update với R_adaptive (diagonal)
+  - KF update với R_adaptive, rồi LS position
 
-Khác V3 (MAD + T-kernel):
+Khác V2/V3-cũ (MAD + T-kernel):
   - Không có bước MAD normalize thứ hai
   - Dùng Gaussian kernel thay T-kernel
-  - Giống hệt _pc_scores_gauss_nb trong sotaV2
-
-PARAMS CẦN TUNE:
-  - r_scale : mức phạt outlier  (thử 1 → 30)
-  [optional]
-  - r_base  : noise baseline mm² (thử 50 → 400)
-  - q       : process noise      (thường fix 0.01)
+  - Giống hệt _pc_scores_gauss_nb trong PC-EKFV4
 
 SO SÁNH 3 PHƯƠNG PHÁP:
   1. Raw + LS
-  2. EKF-2D              (fixed R)
-  3. PC-EKF-sotaPC       (Gaussian pairwise, theo sotaV2)
+  2. KF + LS         (fixed Q, R)
+  3. PC-KF-v3 + LS   (Gaussian pairwise, sigma-free)
 
 Grid search: tự động tìm best (q, r_base, r_scale)
 
@@ -74,236 +68,122 @@ SPEED      = 200.0   # mm/s
 GT_SPACING = 5.0     # mm
 N_ANCHORS  = 4
 
-# EKF-2D baseline params
-EKF2D_Q = 0.01
-EKF2D_R = 50.0
+# KF baseline params
+KF_Q = 0.01
+KF_R = 50.0
 
-# PC-EKF-sotaPC params  — chỉ cần tune r_scale!
-PCEKF_Q       = 0.01
-PCEKF_R_BASE  = 50.0
-PCEKF_R_SCALE = 5.0    # ← PARAM DUY NHẤT CẦN TUNE (thử 1 → 30)
+# PC-KF-v3 params  — chỉ cần tune r_scale!
+PCKF_Q       = 0.01
+PCKF_R_BASE  = 50.0
+PCKF_R_SCALE = 5.0    # ← PARAM DUY NHẤT CẦN TUNE (thử 1 → 30)
 
 DO_GRID_SEARCH = True
 DATA_DIR = "./data"
-SAVE_DIR = "./outputs_PCEKF_v4"
+SAVE_DIR = "./outputs_PCKF_v4"
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  NUMBA JIT KERNELS — logic y hệt V3 gốc, chỉ dịch sang @njit
+#  NUMBA JIT KERNELS
 # ══════════════════════════════════════════════════════════════════════
 @njit(cache=True)
-def _pcekf_step_nb(x, P, z, r_base, r_scale, Q_scalar, anchors):
+def _kf_file_nb(raw_dist, q, r):
     """
-    Một bước PC-EKF V3 hoàn chỉnh: predict + score + update.
-    Logic giống hệt class PCEKF_v3 gốc, chỉ dịch sang Numba.
+    KF 1D per-anchor trên toàn bộ file.
+    Logic giống hệt kf_filter_file + KF1D.update gốc.
     """
-    AH = ANCHOR_HEIGHT
+    T = raw_dist.shape[0]
+    N = raw_dist.shape[1]
+    d_kf = np.zeros((T, N))
+    x    = np.zeros(N)
+    P    = np.ones(N)
+    init = np.zeros(N, dtype=np.bool_)
 
-    # ── Predict (giống PCEKF_v3.predict) ──
-    P[0, 0] += Q_scalar
-    P[1, 1] += Q_scalar
+    for t in range(T):
+        for i in range(N):
+            z = raw_dist[t, i]
+            if not init[i]:
+                x[i]    = z
+                init[i] = True
+                d_kf[t, i] = z
+            else:
+                P_pred     = P[i] + q
+                innovation = z - x[i]
+                K          = P_pred / (P_pred + r)
+                x[i]      += K * innovation
+                P[i]       = (1.0 - K) * P_pred
+                d_kf[t, i] = x[i]
+    return d_kf
 
-    # ── h_obs + jacobian_H (kết hợp 1 vòng cho cache efficiency) ──
-    h  = np.empty(4)
-    Hm = np.empty((4, 2))
-    for i in range(4):
-        dx = x[0] - anchors[i, 0]
-        dy = x[1] - anchors[i, 1]
-        d  = (dx*dx + dy*dy + AH*AH) ** 0.5
-        if d < 1e-6:
-            d = 1e-6
-        h[i]     = d
-        Hm[i, 0] = dx / d
-        Hm[i, 1] = dy / d
 
-    # ── Innovation ──
-    innov = z - h
+@njit(cache=True)
+def _pckf_step_nb(x, P, d_raw, q, r_base, r_scale):
+    """
+    Một bước PC-KF V3: predict + score (Gaussian pairwise) + update cho 4 anchor.
+    Giống hệt cơ chế PC-EKF-V4 (_pc_scores_gauss_nb trong sotaV2).
+    """
+    N = 4
 
-    # ── S_diag: HP[i] @ H[i] + r_base  (giống einsum('ij,ij->i', HP, H)) ──
-    S_diag = np.empty(4)
-    for i in range(4):
-        s = 0.0
-        for k in range(2):
-            row_k = 0.0
-            for j in range(2):
-                row_k += Hm[i, j] * P[j, k]
-            s += row_k * Hm[i, k]
-        S_diag[i] = s + r_base
+    # 1. Predict
+    P_pred = P + q                          # (N,)
 
-    # ── nm[i] = innov[i] / sqrt(S_diag[i])  ~ N(0,1) nếu inlier ──
-    # (giống _pc_scores_gauss_nb trong sotaV2)
-    nm = np.empty(4)
-    for i in range(4):
+    # 2. Innovation
+    innov = d_raw - x                       # (N,)
+
+    # 3. S_diag = P_pred + r_base
+    S_diag = P_pred + r_base               # (N,)
+
+    # 4. nm[i] = innov[i] / sqrt(S_diag[i])  ~ N(0,1) nếu inlier
+    nm = np.empty(N)
+    for i in range(N):
         s = S_diag[i]; s = s if s > 1e-9 else 1e-9
-        nm[i] = innov[i] / math.sqrt(s)
+        nm[i] = innov[i] / (s ** 0.5)
 
-    # ── Pairwise Gaussian kernel (sotaV2): score[i] = mean exp(-0.25*(nm[i]-nm[j])²) ──
-    # Variance của hiệu = 2 (diff 2 N(0,1)) → -d²/(2*2) = -0.25*d²
-    scores = np.empty(4)
-    for i in range(4):
+    # 5. Pairwise Gaussian kernel (sotaV2/EKFV4):
+    #    score[i] = mean exp(-0.25*(nm[i]-nm[j])²) for j≠i
+    #    Variance của hiệu = 2 (diff 2 N(0,1)) → -d²/(2*2) = -0.25*d²
+    scores = np.empty(N)
+    for i in range(N):
         s = 0.0
-        for j in range(4):
+        for j in range(N):
             if j != i:
                 d = nm[i] - nm[j]
                 s += math.exp(-0.25 * d * d)
         scores[i] = s / 3.0   # mean over N-1=3 pairs
 
-    # ── R_adaptive (diagonal) ──
-    R = np.zeros((4, 4))
-    for i in range(4):
-        R[i, i] = r_base * (1.0 + r_scale * (1.0 - scores[i]))
+    # 6. Adaptive R
+    R_adap = np.empty(N)
+    for i in range(N):
+        R_adap[i] = r_base * (1.0 + r_scale * (1.0 - scores[i]))
 
-    # ── EKF update: S_mat = H P H^T + R ──
-    HP    = Hm @ P               # (4, 2)
-    S_mat = HP @ Hm.T + R        # (4, 4)
-
-    # Giải S_mat @ X = (H @ P) bằng Gauss-Jordan (njit không có linalg.solve/inv)
-    # K^T = S_mat^{-1} @ (H @ P)  →  K = (H @ P)^T @ S_mat^{-T}
-    HtP = Hm @ P                 # (4, 2)
-    aug = np.empty((4, 6))
-    for i in range(4):
-        for j in range(4):
-            aug[i, j]   = S_mat[i, j]
-        for j in range(2):
-            aug[i, 4+j] = HtP[i, j]
-
-    for col in range(4):
-        # Partial pivoting
-        max_v = abs(aug[col, col])
-        piv   = col
-        for r in range(col + 1, 4):
-            if abs(aug[r, col]) > max_v:
-                max_v = abs(aug[r, col])
-                piv   = r
-        if piv != col:
-            for j in range(6):
-                aug[col, j], aug[piv, j] = aug[piv, j], aug[col, j]
-        dv = aug[col, col]
-        if abs(dv) < 1e-12:
-            dv = 1e-12
-        for j in range(6):
-            aug[col, j] /= dv
-        for r in range(4):
-            if r != col:
-                f = aug[r, col]
-                for j in range(6):
-                    aug[r, j] -= f * aug[col, j]
-
-    # Đọc K: K[i, j] = aug[j, 4+i]  →  K shape (2, 4)
-    K = np.empty((2, 4))
-    for i in range(2):
-        for j in range(4):
-            K[i, j] = aug[j, 4 + i]
-
-    # ── x update: x = x + K @ innov ──
-    Kv = K @ innov
-    x[0] += Kv[0]
-    x[1] += Kv[1]
-
-    # ── P update: P = (I - K H) P ──
-    KH  = K @ Hm
-    IKH = np.eye(2) - KH
-    P[:] = IKH @ P
+    # 7. KF update
+    K = P_pred / (P_pred + R_adap)
+    x = x + K * innov
+    P = (1.0 - K) * P_pred
 
     return x, P, scores
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  NUMBA JIT KERNEL — EKF-2D BASELINE (R = R_scalar * I)
-# ══════════════════════════════════════════════════════════════════════
 @njit(cache=True)
-def _ekf2d_step_nb(x, P, z, Q_scalar, R_scalar, anchors):
+def _pckf_file_nb(raw_dist, q, r_base, r_scale):
     """
-    Một bước EKF-2D chuẩn: predict + update với R = R_scalar * I.
-    Logic giống hệt EKF2D.step() gốc, dịch sang Numba.
+    PC-KF V3 trên toàn bộ file (Gaussian pairwise, sigma-free).
     """
-    AH = ANCHOR_HEIGHT
+    T = raw_dist.shape[0]
+    N = raw_dist.shape[1]
+    d_kf = np.zeros((T, N))
+    scrs = np.zeros((T, N))
 
-    # ── Predict ──
-    P[0, 0] += Q_scalar
-    P[1, 1] += Q_scalar
+    # Khởi tạo (timestep đầu tiên)
+    x = raw_dist[0].copy()
+    P = np.ones(N)
+    d_kf[0] = x
+    scrs[0] = np.ones(N)
 
-    # ── h_obs + jacobian_H ──
-    h  = np.empty(4)
-    Hm = np.empty((4, 2))
-    for i in range(4):
-        dx = x[0] - anchors[i, 0]
-        dy = x[1] - anchors[i, 1]
-        d  = (dx*dx + dy*dy + AH*AH) ** 0.5
-        if d < 1e-6:
-            d = 1e-6
-        h[i]     = d
-        Hm[i, 0] = dx / d
-        Hm[i, 1] = dy / d
+    for t in range(1, T):
+        x, P, scrs[t] = _pckf_step_nb(x, P, raw_dist[t], q, r_base, r_scale)
+        d_kf[t] = x
 
-    # ── Innovation ──
-    innov = z - h
-
-    # ── S = H P H^T + R_scalar * I ──
-    HP    = Hm @ P
-    S_mat = HP @ Hm.T
-    for i in range(4):
-        S_mat[i, i] += R_scalar
-
-    # ── Gauss-Jordan solve: aug = [S | HP], K = (HP)^T @ S^{-1} ──
-    aug = np.empty((4, 6))
-    for i in range(4):
-        for j in range(4):
-            aug[i, j]   = S_mat[i, j]
-        for j in range(2):
-            aug[i, 4+j] = HP[i, j]
-
-    for col in range(4):
-        max_v = abs(aug[col, col])
-        piv   = col
-        for r in range(col + 1, 4):
-            if abs(aug[r, col]) > max_v:
-                max_v = abs(aug[r, col])
-                piv   = r
-        if piv != col:
-            for j in range(6):
-                aug[col, j], aug[piv, j] = aug[piv, j], aug[col, j]
-        dv = aug[col, col]
-        if abs(dv) < 1e-12:
-            dv = 1e-12
-        for j in range(6):
-            aug[col, j] /= dv
-        for r in range(4):
-            if r != col:
-                f = aug[r, col]
-                for j in range(6):
-                    aug[r, j] -= f * aug[col, j]
-
-    K = np.empty((2, 4))
-    for i in range(2):
-        for j in range(4):
-            K[i, j] = aug[j, 4 + i]
-
-    # ── x update ──
-    Kv = K @ innov
-    x[0] += Kv[0]
-    x[1] += Kv[1]
-
-    # ── P update: P = (I - K H) P ──
-    KH  = K @ Hm
-    IKH = np.eye(2) - KH
-    P[:] = IKH @ P
-
-    return x, P
-
-
-@njit(cache=True)
-def _ekf2d_file_nb(raw_dist, x0, Q_scalar, R_scalar, anchors):
-    """EKF-2D trên toàn bộ file — full JIT, không cần Python loop."""
-    T   = raw_dist.shape[0]
-    pos = np.empty((T, 2))
-    x   = x0.copy()
-    P   = np.eye(2) * 1e6
-    for t in range(T):
-        x, P = _ekf2d_step_nb(x, P, raw_dist[t], Q_scalar, R_scalar, anchors)
-        pos[t, 0] = x[0]
-        pos[t, 1] = x[1]
-    return pos
+    return d_kf, scrs
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -357,12 +237,9 @@ def _ls_file_nb(dist_mat, anchors):
 
 def _warmup_numba():
     """Trigger JIT compilation khi import — tất cả kernels."""
-    _x   = np.array([2000.0, 4400.0])
-    _P   = np.eye(2) * 1e6
-    _z   = np.array([5000.0, 5000.0, 5000.0, 5000.0])
     _raw = np.ones((2, 4), dtype=np.float64) * 3000.0
-    _ekf2d_file_nb(_raw, _x.copy(), 0.01, 50.0, ANCHORS)
-    _pcekf_step_nb(_x.copy(), _P.copy(), _z, 50.0, 20.0, 0.01, ANCHORS)
+    _kf_file_nb(_raw, 0.01, 50.0)
+    _pckf_file_nb(_raw, 0.01, 50.0, 5.0)
     _ls_file_nb(_raw, ANCHORS)
 
 print("[Numba] Compiling JIT kernels...", end=" ", flush=True)
@@ -417,28 +294,7 @@ def ls_position(distances, anchors=ANCHORS):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  OBSERVATION MODEL (EKF)
-# ══════════════════════════════════════════════════════════════════════
-def h_obs(state, anchors=ANCHORS):
-    x, y = state
-    return np.array([
-        math.sqrt((x - ax)**2 + (y - ay)**2 + ANCHOR_HEIGHT**2)
-        for ax, ay in anchors
-    ])
-
-
-def jacobian_H(state, anchors=ANCHORS):
-    x, y = state
-    H = np.zeros((N_ANCHORS, 2))
-    for i, (ax, ay) in enumerate(anchors):
-        dist = max(math.sqrt((x-ax)**2 + (y-ay)**2 + ANCHOR_HEIGHT**2), 1e-6)
-        H[i, 0] = (x - ax) / dist
-        H[i, 1] = (y - ay) / dist
-    return H
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  GAUSSIAN PAIRWISE KERNEL  (theo sotaV2)
+#  GAUSSIAN PAIRWISE KERNEL  (theo sotaV2 / PC-EKFV4)
 # ══════════════════════════════════════════════════════════════════════
 def _gauss_kernel(diff_vec):
     """Gaussian kernel với variance=2 (diff 2 N(0,1)): exp(-d²/4)."""
@@ -446,15 +302,15 @@ def _gauss_kernel(diff_vec):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  PC SCORING — Gaussian Pairwise (sotaV2 mechanism)
+#  PC SCORING — Gaussian Pairwise (sotaV2 / PC-EKFV4 mechanism)
 # ══════════════════════════════════════════════════════════════════════
 def pc_scores_gauss(innovations, S_diag):
     """
-    Gaussian pairwise consistency scoring — giống sotaV2 (_pc_scores_gauss_nb).
+    Gaussian pairwise consistency scoring — giống PC-EKFV4 (_pc_scores_gauss_nb).
 
     Bước 1 — Chuẩn hóa theo S_ii:
         nm[i] = innovations[i] / sqrt(S_ii)
-        S_ii = H_i @ P_pred @ H_i^T + R_base
+        S_ii = P_pred[i] + R_base
         → nm[i] ~ N(0,1) khi LOS
 
     Bước 2 — Pairwise Gaussian kernel:
@@ -474,145 +330,98 @@ def pc_scores_gauss(innovations, S_diag):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  EKF-2D BASELINE
+#  KF 1D BASELINE
 # ══════════════════════════════════════════════════════════════════════
-class EKF2D:
-    """EKF với state [x, y], R đồng nhất."""
-    def __init__(self, q=EKF2D_Q, r=EKF2D_R):
-        self.Q_scalar = q
-        self.R_scalar = r
-        self.x = None
-        self.P = None
+class KF1D:
+    """KF 1D per-anchor, dùng cho baseline KF + LS."""
+    def __init__(self, q=KF_Q, r=KF_R):
+        self.Q = q; self.R = r
+        self.P = 1.0; self.x = None
 
-    def init(self, x0):
-        self.x = x0.copy().astype(float)
-        self.P = np.eye(2) * 1e6
-
-    def predict(self):
-        self.P = self.P + np.eye(2) * self.Q_scalar
-
-    def update(self, z_raw):
+    def update(self, z):
         if self.x is None:
-            return np.array([np.nan, np.nan])
-        h = h_obs(self.x)
-        H = jacobian_H(self.x)
-        R = np.eye(N_ANCHORS) * self.R_scalar
-        S = H @ self.P @ H.T + R
-        try:
-            K = self.P @ H.T @ np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            return self.x.copy()
-        self.x = self.x + K @ (z_raw - h)
-        self.P = (np.eye(2) - K @ H) @ self.P
-        return self.x.copy()
-
-    def step(self, z_raw):
-        self.predict()
-        return self.update(z_raw)
+            self.x = z; return self.x, 0.0
+        P_pred     = self.P + self.Q
+        innovation = z - self.x
+        K          = P_pred / (P_pred + self.R)
+        self.x    += K * innovation
+        self.P     = (1 - K) * P_pred
+        return self.x, innovation
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  PC-EKF V3 — MAD Auto-Normalized, Sigma-Free
+#  PC-KF V3 — Gaussian Pairwise, Sigma-Free
 # ══════════════════════════════════════════════════════════════════════
-class PCEKF_v3:
+class PCKF_v3:
     """
-    PC-EKF V3: EKF-2D với PC scoring MAD auto-normalized.
-    Không cần tune sigma — chỉ tune r_scale.
+    PC-KF V3: KF 1D per-anchor với PC scoring Gaussian pairwise.
+    Giống cơ chế PC-EKFV4. Không cần tune sigma — chỉ tune r_scale.
 
     Pipeline mỗi timestep:
-      1. EKF predict: P_pred = P + Q*I
-      2. h = h_obs(x̂),  H = jacobian_H(x̂)
-      3. innovation ν[i] = z_raw[i] - h[i]
-      4. S_ii = H_i @ P_pred @ H_i^T + R_base   (scalar per anchor)
-      5. std_innov[i] = ν[i] / sqrt(S_ii)
-      6. MAD normalize → normed[i]
-      7. T-kernel(normed, sigma=1.0) → score[i] ∈ [0,1]
-      8. R_adaptive[i] = R_base * (1 + r_scale*(1-score[i]))
-      9. EKF update với R_adaptive (diagonal R)
+      1. Predict: P_pred[i] = P[i] + Q  (per-anchor scalar)
+      2. Innovation: ν[i] = z[i] - x̂[i]
+      3. S_ii = P_pred[i] + R_base       (per-anchor prediction variance)
+      4. nm[i] = ν[i] / sqrt(S_ii)       → chuẩn hóa ~ N(0,1)
+      5. Gaussian pairwise kernel → score[i] ∈ [0,1]
+      6. R_adaptive[i] = R_base * (1 + r_scale * (1 - score[i]))
+      7. KF update: K[i] = P_pred[i] / (P_pred[i] + R_adaptive[i])
+                    x̂[i] += K[i] * ν[i]
+                    P[i]  = (1 - K[i]) * P_pred[i]
+      8. LS position từ filtered distances
     """
-    def __init__(self, q=PCEKF_Q, r_base=PCEKF_R_BASE, r_scale=PCEKF_R_SCALE):
-        self.Q_scalar = q
-        self.R_base   = r_base
-        self.R_scale  = r_scale
-        self.x = None
-        self.P = None
+    def __init__(self, q=PCKF_Q, r_base=PCKF_R_BASE, r_scale=PCKF_R_SCALE):
+        self.Q       = q
+        self.R_base  = r_base
+        self.R_scale = r_scale
+        self.P       = np.ones(N_ANCHORS)
+        self.x       = None   # per-anchor distance estimate
 
-    def init(self, x0):
-        self.x = x0.copy().astype(float)
-        self.P = np.eye(2) * 1e6
-
-    def predict(self):
-        self.P = self.P + np.eye(2) * self.Q_scalar
-
-    def update(self, z_raw):
+    def update(self, d_raw):
+        """
+        d_raw: (N_ANCHORS,) khoảng cách ground đo được.
+        Trả về: (d_filtered, scores)
+        """
         if self.x is None:
-            return np.array([np.nan, np.nan]), np.ones(N_ANCHORS)
+            self.x = d_raw.copy()
+            return self.x.copy(), np.ones(N_ANCHORS)
 
-        h = h_obs(self.x)
-        H = jacobian_H(self.x)               # (N_ANCHORS, 2)
+        # 1. Predict
+        P_pred = self.P + self.Q                     # (N_ANCHORS,)
 
-        # Innovation
-        innov = z_raw - h                    # (N_ANCHORS,)
+        # 2. Innovation
+        innov  = d_raw - self.x                      # (N_ANCHORS,)
 
-        # S_ii = H_i @ P @ H_i^T + R_base   (per-anchor scalar)
-        HP     = H @ self.P                  # (N_ANCHORS, 2)
-        S_diag = np.array([HP[i] @ H[i] + self.R_base
-                            for i in range(N_ANCHORS)])
+        # 3. S_ii = P_pred[i] + R_base
+        S_diag = P_pred + self.R_base                # (N_ANCHORS,)
 
-        # PC scoring V3 — MAD auto-normalized, no sigma param
-        scores = pc_scores_v3(innov, S_diag)
+        # 4-5. PC scoring Gaussian pairwise (giống PC-EKFV4)
+        scores = pc_scores_gauss(innov, S_diag)
 
-        # Adaptive R (diagonal)
-        R_diag = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
-        R      = np.diag(R_diag)
+        # 6. Adaptive R
+        R_adap = self.R_base * (1.0 + self.R_scale * (1.0 - scores))
 
-        # EKF update
-        S = H @ self.P @ H.T + R
-        try:
-            K = self.P @ H.T @ np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            return self.x.copy(), scores
+        # 7. KF update với R_adaptive
+        K      = P_pred / (P_pred + R_adap)
+        self.x = self.x + K * innov
+        self.P = (1 - K) * P_pred
 
-        self.x = self.x + K @ innov
-        self.P = (np.eye(2) - K @ H) @ self.P
         return self.x.copy(), scores
 
-    def step(self, z_raw):
-        self.predict()
-        return self.update(z_raw)
-
 
 # ══════════════════════════════════════════════════════════════════════
-#  FILTER WRAPPERS
+#  FILTER WRAPPERS — dùng Numba kernel
 # ══════════════════════════════════════════════════════════════════════
-def _init_pos(raw_dist):
-    pos = ls_position(raw_dist[0])
-    return pos if not np.any(np.isnan(pos)) else np.array([2000.0, 4400.0])
+def kf_filter_file(raw_dist, q=KF_Q, r=KF_R):
+    d_kf = _kf_file_nb(raw_dist.astype(np.float64), float(q), float(r))
+    return d_kf.astype(np.float32)
 
 
-def ekf2d_filter_file(raw_dist, q=EKF2D_Q, r=EKF2D_R):
-    """Dùng Numba kernel — logic giống hệt EKF2D Python, full JIT."""
-    x0  = _init_pos(raw_dist).astype(np.float64)
-    pos = _ekf2d_file_nb(
+def pckf_v3_filter_file(raw_dist, q=PCKF_Q, r_base=PCKF_R_BASE,
+                         r_scale=PCKF_R_SCALE):
+    d_kf, scrs = _pckf_file_nb(
         raw_dist.astype(np.float64),
-        x0, float(q), float(r), ANCHORS)
-    return pos
-
-
-def pcekf_v3_filter_file(raw_dist, q=PCEKF_Q, r_base=PCEKF_R_BASE,
-                          r_scale=PCEKF_R_SCALE):
-    """Dùng Numba kernel — kết quả số học giống hệt PCEKF_v3 Python."""
-    T    = len(raw_dist)
-    x    = _init_pos(raw_dist).astype(np.float64)
-    P    = np.eye(2) * 1e6
-    pos  = np.full((T, 2), np.nan)
-    scrs = np.zeros((T, N_ANCHORS))
-    for t in range(T):
-        x, P, scrs[t] = _pcekf_step_nb(
-            x, P, raw_dist[t].astype(np.float64),
-            float(r_base), float(r_scale), float(q), ANCHORS)
-        pos[t] = x
-    return pos, scrs
+        float(q), float(r_base), float(r_scale))
+    return d_kf.astype(np.float32), scrs.astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -641,19 +450,18 @@ def parse_file(path):
 #  EVALUATE
 # ══════════════════════════════════════════════════════════════════════
 def evaluate_files(file_paths, gt_xy,
-                   q=PCEKF_Q, r_base=PCEKF_R_BASE, r_scale=PCEKF_R_SCALE):
-    raw_pos_all   = []
-    ekf_pos_all   = []
-    pcekf_pos_all = []
-    per_file_rmse = {'Raw + LS': [], 'EKF-2D': [], 'PC-EKF-v3': []}
+                   q=PCKF_Q, r_base=PCKF_R_BASE, r_scale=PCKF_R_SCALE):
+    raw_pos_all  = []
+    kf_pos_all   = []
+    pckf_pos_all = []
+    per_file_rmse = {'Raw + LS': [], 'KF + LS': [], 'PC-KF-v3 + LS': []}
 
     W = 95
     print("\n" + "═"*W)
-    print(f"  PC-EKF V3 — PER-FILE RESULTS")
+    print(f"  PC-KF V3 — PER-FILE RESULTS")
     print("═"*W)
-    print(f"{'File':<18s} {'Raw+LS':>10s} {'EKF-2D':>10s} "
-          f"{'PC-EKF-v3':>12s} | "
-          f"{'EKF T_fl':>10s} {'PCEKF T_fl':>11s} {'PCEKF T_smpl':>13s}")
+    print(f"{'File':<18s} {'Raw+LS':>10s} {'KF+LS':>10s} {'PC-KF-v3':>12s} | "
+          f"{'KF T_file':>11s} {'PCKF T_fl':>11s} {'PCKF T_smpl':>12s}")
     print("─"*W)
 
     for path in file_paths:
@@ -662,18 +470,21 @@ def evaluate_files(file_paths, gt_xy,
         dist_raw = parsed['dist'].astype(float)
         T = len(dist_raw)
 
-        # 1. Raw + LS
         dist_f64 = dist_raw.astype(np.float64)
-        raw_pos  = _ls_file_nb(dist_f64, ANCHORS)
 
-        # 2. EKF-2D
+        # 1. Raw + LS
+        raw_pos = _ls_file_nb(dist_f64, ANCHORS)
+
+        # 2. KF + LS
         t0 = time.perf_counter()
-        ekf_pos = ekf2d_filter_file(dist_raw)
+        d_kf   = kf_filter_file(dist_raw)
+        kf_pos = _ls_file_nb(d_kf.astype(np.float64), ANCHORS)
         t1 = time.perf_counter()
 
-        # 3. PC-EKF-v3
-        pcekf_pos, _ = pcekf_v3_filter_file(
+        # 3. PC-KF-v3 + LS
+        d_pckf, _ = pckf_v3_filter_file(
             dist_raw, q=q, r_base=r_base, r_scale=r_scale)
+        pckf_pos = _ls_file_nb(d_pckf.astype(np.float64), ANCHORS)
         t2 = time.perf_counter()
 
         def filt(p): return p[~np.any(np.isnan(p), axis=1)]
@@ -681,36 +492,36 @@ def evaluate_files(file_paths, gt_xy,
             e = nearest_gt_error(filt(p), gt_xy)
             return float(np.sqrt(np.mean(e**2))) if len(e) > 0 else float('nan')
 
-        r_raw   = rmse(raw_pos)
-        r_ekf   = rmse(ekf_pos)
-        r_pcekf = rmse(pcekf_pos)
+        r_raw  = rmse(raw_pos)
+        r_kf   = rmse(kf_pos)
+        r_pckf = rmse(pckf_pos)
 
-        t_ekf   = (t1 - t0) * 1000
-        t_pcekf = (t2 - t1) * 1000
+        t_kf   = (t1 - t0) * 1000
+        t_pckf = (t2 - t1) * 1000
         print(f"{os.path.basename(path):<18s}"
-              f"{r_raw:>10.1f}{r_ekf:>10.1f}"
-              f"{r_pcekf:>12.1f} | "
-              f"{t_ekf:>8.1f}ms {t_pcekf:>9.1f}ms {t_pcekf/T*1000:>11.3f}ms")
+              f"{r_raw:>10.1f}{r_kf:>10.1f}"
+              f"{r_pckf:>12.1f} | "
+              f"{t_kf:>9.1f}ms {t_pckf:>9.1f}ms {t_pckf/T*1000:>10.3f}ms")
 
-        per_file_rmse['Raw + LS'].append(r_raw)
-        per_file_rmse['EKF-2D']  .append(r_ekf)
-        per_file_rmse['PC-EKF-v3'].append(r_pcekf)
+        per_file_rmse['Raw + LS']     .append(r_raw)
+        per_file_rmse['KF + LS']      .append(r_kf)
+        per_file_rmse['PC-KF-v3 + LS'].append(r_pckf)
 
-        raw_pos_all  .extend(filt(raw_pos))
-        ekf_pos_all  .extend(filt(ekf_pos))
-        pcekf_pos_all.extend(filt(pcekf_pos))
+        raw_pos_all .extend(filt(raw_pos))
+        kf_pos_all  .extend(filt(kf_pos))
+        pckf_pos_all.extend(filt(pckf_pos))
 
     print("─"*W)
-    raw_arr   = np.array(raw_pos_all)
-    ekf_arr   = np.array(ekf_pos_all)
-    pcekf_arr = np.array(pcekf_pos_all)
+    raw_arr  = np.array(raw_pos_all)
+    kf_arr   = np.array(kf_pos_all)
+    pckf_arr = np.array(pckf_pos_all)
 
     errors = {
-        'Raw + LS' : nearest_gt_error(raw_arr,   gt_xy),
-        'EKF-2D'    : nearest_gt_error(ekf_arr,   gt_xy),
-        'PC-EKF-v3' : nearest_gt_error(pcekf_arr, gt_xy),
+        'Raw + LS'      : nearest_gt_error(raw_arr,  gt_xy),
+        'KF + LS'       : nearest_gt_error(kf_arr,   gt_xy),
+        'PC-KF-v3 + LS' : nearest_gt_error(pckf_arr, gt_xy),
     }
-    positions = {'raw': raw_arr, 'ekf': ekf_arr, 'pcekf': pcekf_arr}
+    positions = {'raw': raw_arr, 'kf': kf_arr, 'pckf': pckf_arr}
     return errors, positions, per_file_rmse
 
 
@@ -745,11 +556,11 @@ def compute_metrics(errors, label="", pf_rmse=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  GRID SEARCH  (chỉ còn 3 params, bỏ sigma)
+#  GRID SEARCH
 # ══════════════════════════════════════════════════════════════════════
 def grid_search(val_files, gt_xy):
     """
-    Grid search cho PC-EKF V3.
+    Grid search cho PC-KF V3.
     sigma đã bị loại — chỉ còn q, r_base, r_scale.
     """
     grid = {
@@ -757,10 +568,10 @@ def grid_search(val_files, gt_xy):
         'r_base'  : [50.0],
         'r_scale' : [0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0],
     }
-    keys    = list(grid.keys())
-    combos  = list(itertools.product(*[grid[k] for k in keys]))
+    keys   = list(grid.keys())
+    combos = list(itertools.product(*[grid[k] for k in keys]))
     n_combo = len(combos)
-    print(f"\n  Grid search PC-EKF V3: {n_combo} combinations "
+    print(f"\n  Grid search PC-KF V3: {n_combo} combinations "
           f"(vs {n_combo * 6} với sigma — giảm 6x)...")
 
     best_rmse   = float('inf')
@@ -770,8 +581,8 @@ def grid_search(val_files, gt_xy):
     for idx, combo in enumerate(combos):
         params = dict(zip(keys, combo))
         err, _, pf = evaluate_files(val_files, gt_xy, **params)
-        vals   = [v for v in pf['PC-EKF-v3'] if not math.isnan(v)]
-        rmse   = float(np.mean(vals)) if vals else float('inf')
+        vals = [v for v in pf['PC-KF-v3 + LS'] if not math.isnan(v)]
+        rmse = float(np.mean(vals)) if vals else float('inf')
         results.append((rmse, params))
         if rmse < best_rmse:
             best_rmse   = rmse
@@ -780,7 +591,7 @@ def grid_search(val_files, gt_xy):
             print(f"  [{idx+1}/{n_combo}] best so far: mean RMSE={best_rmse:.1f}mm")
 
     results.sort(key=lambda x: x[0])
-    print(f"\n  Top 5 configs (PC-EKF V3):")
+    print(f"\n  Top 5 configs (PC-KF V3):")
     print(f"  {'mean RMSE':>10s} {'Q':>8s} {'R_base':>8s} {'r_scale':>8s}")
     print(f"  {'─'*40}")
     for rmse, p in results[:5]:
@@ -794,14 +605,14 @@ def grid_search(val_files, gt_xy):
 #  PLOTS
 # ══════════════════════════════════════════════════════════════════════
 COLORS = {
-    'Raw + LS' : '#9E9E9E',
-    'EKF-2D'    : '#E91E63',
-    'PC-EKF-v3' : '#2196F3',
+    'Raw + LS'      : '#9E9E9E',
+    'KF + LS'       : '#E91E63',
+    'PC-KF-v3 + LS' : '#2196F3',
 }
 LS = {
-    'Raw + LS' : ':',
-    'EKF-2D'    : '--',
-    'PC-EKF-v3' : '-',
+    'Raw + LS'      : ':',
+    'KF + LS'       : '--',
+    'PC-KF-v3 + LS' : '-',
 }
 
 
@@ -881,14 +692,15 @@ def plot_bar(metrics_dict, save_path):
     plt.close()
 
 
-def analyze_scores(file_paths, q=PCEKF_Q, r_base=PCEKF_R_BASE,
-                   r_scale=PCEKF_R_SCALE, save_path=None):
+def analyze_scores(file_paths, q=PCKF_Q, r_base=PCKF_R_BASE,
+                   r_scale=PCKF_R_SCALE, save_path=None):
     """Phân tích scores V3 và R adaptive trên file đầu tiên."""
     parsed = parse_file(file_paths[0])
     if parsed is None: return
     dist_raw = parsed['dist'].astype(float)
 
-    _, scores = pcekf_v3_filter_file(dist_raw, q=q, r_base=r_base, r_scale=r_scale)
+    _, scores = pckf_v3_filter_file(dist_raw, q=q, r_base=r_base,
+                                    r_scale=r_scale)
     R_adaptive = r_base * (1.0 + r_scale * (1.0 - scores))
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 11), sharex=True)
@@ -900,7 +712,7 @@ def analyze_scores(file_paths, q=PCEKF_Q, r_base=PCEKF_R_BASE,
     axes[0].axhline(0.5, color='gray', ls='--', lw=1, label='threshold 0.5')
     axes[0].set_ylabel('PC Score V3', fontsize=11)
     axes[0].set_title(
-        f'PC-EKF V3 Scores (MAD auto-normalized, sigma-free) — {os.path.basename(file_paths[0])}',
+        f'PC-KF V3 Scores (Gaussian pairwise, sigma-free) — {os.path.basename(file_paths[0])}',
         fontsize=12, fontweight='bold')
     axes[0].legend(fontsize=9); axes[0].grid(True, alpha=0.3); axes[0].set_ylim(0, 1.05)
 
@@ -932,11 +744,11 @@ def analyze_scores(file_paths, q=PCEKF_Q, r_base=PCEKF_R_BASE,
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
 def main():
-    print("PC-EKF V3 — MAD Auto-Normalized, Sigma-Free")
-    print("  Không dùng KF 1D phụ trợ")
-    print("  Innovation từ EKF predict, normalize S_ii = H_i@P@H_i^T + R_base")
-    print("  MAD auto-scale → sigma=1.0 cố định, KHÔNG CẦN tune sigma")
-    print(f"  Chỉ tune: r_scale (hiện tại = {PCEKF_R_SCALE})")
+    print("PC-KF V3 — Gaussian Pairwise, Sigma-Free")
+    print("  Không dùng MAD normalize")
+    print("  Innovation từ KF predict, normalize S_ii = P_pred[i] + R_base")
+    print("  Gaussian pairwise kernel → sigma-free, KHÔNG CẦN tune sigma")
+    print(f"  Chỉ tune: r_scale (hiện tại = {PCKF_R_SCALE})")
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     all_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.txt")))
@@ -952,10 +764,10 @@ def main():
     total_path = np.linalg.norm(np.diff(WAYPOINTS, axis=0), axis=1).sum()
     print(f"Path={total_path:.0f}mm  GT={len(gt_xy)} pts")
 
-    best_params = dict(q=PCEKF_Q, r_base=PCEKF_R_BASE, r_scale=PCEKF_R_SCALE)
+    best_params = dict(q=PCKF_Q, r_base=PCKF_R_BASE, r_scale=PCKF_R_SCALE)
 
     if DO_GRID_SEARCH:
-        print(f"\n[Grid Search] Dùng toàn bộ {n} files...")
+        print(f"\n[Grid Search] Dùng toàn bộ {n} files để tìm best params...")
         best_params, _ = grid_search(shuffled, gt_xy)
     else:
         print("\n[INFO] Grid Search TẮT — dùng params mặc định.")
@@ -964,7 +776,7 @@ def main():
 
     print(f"\n{'═'*60}\n  Evaluating {len(eval_files)} files\n{'═'*60}")
     print(f"  Params: {best_params}")
-    print(f"  NOTE: sigma đã bị loại (MAD auto-normalize)")
+    print(f"  NOTE: sigma đã bị loại (Gaussian pairwise tự normalize)")
 
     err, positions, per_file_rmse = evaluate_files(eval_files, gt_xy, **best_params)
     metrics = {label: compute_metrics(errors, label, pf_rmse=per_file_rmse.get(label))
@@ -972,42 +784,42 @@ def main():
 
     # Summary
     print(f"\n{'═'*88}")
-    print(f"  SUMMARY — PC-EKF V3 (sigma-free)")
+    print(f"  SUMMARY — PC-KF V3 (sigma-free)")
     print(f"{'═'*88}")
-    print(f"  {'Method':<18s} {'RMSE mean±std':>18s} {'MAE':>7s} {'CEP50':>7s} {'P95':>7s} {'MAX':>7s}")
-    print(f"  {'─'*70}")
+    print(f"  {'Method':<22s} {'RMSE mean±std':>18s} {'MAE':>7s} {'CEP50':>7s} {'P95':>7s} {'MAX':>7s}")
+    print(f"  {'─'*72}")
     for label, m in metrics.items():
-        tag = " ◀ V3" if 'PC-EKF' in label else ""
+        tag = " ◀ V3" if 'PC-KF-v3' in label else ""
         if not math.isnan(m.get('rmse_std', float('nan'))):
             rmse_str = f"{m['rmse_mean']:>6.1f} ± {m['rmse_std']:.1f}"
         else:
             rmse_str = f"{m['rmse_mean']:>6.1f} ± N/A"
-        print(f"  {label:<18s} {rmse_str:>18s} {m['mae']:>6.1f} "
+        print(f"  {label:<22s} {rmse_str:>18s} {m['mae']:>6.1f} "
               f"{m['cep50']:>6.1f} {m['p95']:>6.1f} {m['max']:>6.1f}{tag}")
 
     # Wilcoxon
-    print(f"\n  Wilcoxon tests (vs PC-EKF-v3):")
-    for a in ['Raw + LS', 'EKF-2D']:
-        ea, eb = err[a], err['PC-EKF-v3']
+    print(f"\n  Wilcoxon tests (vs PC-KF-v3):")
+    for a in ['Raw + LS', 'KF + LS']:
+        ea, eb = err[a], err['PC-KF-v3 + LS']
         mn = min(len(ea), len(eb))
         if mn > 10:
             try:
                 _, p = wilcoxon(ea[:mn], eb[:mn])
-                print(f"    {a} vs PC-EKF-v3: p={p:.4f} {'✅' if p<0.05 else '⚠️'}")
+                print(f"    {a} vs PC-KF-v3: p={p:.4f} {'✅' if p<0.05 else '⚠️'}")
             except ValueError:
                 pass
 
     print(f"\n  Best params:")
     print(f"    q={best_params['q']}, r_base={best_params['r_base']}, "
           f"r_scale={best_params['r_scale']}")
-    print(f"  [sigma-free: MAD tự động normalize, không cần tune]")
+    print(f"  [sigma-free: Gaussian pairwise tự normalize, không cần tune]")
 
     # Plots
     plot_cdf(err, os.path.join(SAVE_DIR, 'cdf.png'))
     plot_trajectories(
-        {'Raw + LS' : positions['raw'],
-         'EKF-2D'    : positions['ekf'],
-         'PC-EKF-v3' : positions['pcekf']},
+        {'Raw + LS'      : positions['raw'],
+         'KF + LS'       : positions['kf'],
+         'PC-KF-v3 + LS' : positions['pckf']},
         gt_xy, os.path.join(SAVE_DIR, 'trajectories.png'))
     plot_bar(metrics, os.path.join(SAVE_DIR, 'bar.png'))
     analyze_scores(eval_files, save_path=os.path.join(SAVE_DIR, 'score_analysis.png'),
