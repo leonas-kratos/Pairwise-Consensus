@@ -81,7 +81,7 @@ EKF2D_R = 50.0
 # PC-EKF-sotaPC params  — chỉ cần tune r_scale!
 PCEKF_Q       = 0.01
 PCEKF_R_BASE  = 50.0
-PCEKF_R_SCALE = 5.0    # ← PARAM DUY NHẤT CẦN TUNE (thử 1 → 30)
+PCEKF_R_SCALE = 1.0    # ← PARAM DUY NHẤT CẦN TUNE (thử 1 → 30)
 
 DO_GRID_SEARCH = True
 DATA_DIR = "./data"
